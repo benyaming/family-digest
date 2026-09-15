@@ -62,8 +62,12 @@ export class FamilyService {
     const needle = query.trim().toLocaleLowerCase();
     if (!needle) return undefined;
     const parts = (kid: { name: string }) => kid.name.split('/').map(p => p.trim().toLocaleLowerCase()).filter(Boolean);
-    return this.family.find(k => parts(k).some(p => p === needle))
-      ?? this.family.find(k => parts(k).some(p => p.startsWith(needle)));
+    const exact = this.family.find(k => parts(k).some(p => p === needle));
+    if (exact) return exact;
+    // A prefix is only an answer when it names one child: "Дани" between Даниэль and Данила
+    // would otherwise delete or reassign whichever happens to be stored first.
+    const prefixed = this.family.filter(k => parts(k).some(p => p.startsWith(needle)));
+    return prefixed.length === 1 ? prefixed[0] : undefined;
   }
   get chatIds() { return this.groups.map(g => g.id); }
   context(group?: Group, now = Date.now()) {
@@ -86,6 +90,10 @@ export class FamilyService {
     const matches = this.groups.filter(g => g.id === filter || g.name.toLocaleLowerCase().includes(filter.toLocaleLowerCase()));
     if (!matches.length) throw new ReplyError('Группа не найдена. Используйте /chats.');
     return matches;
+  }
+  /** The calendar day an instant falls on, in the family's own timezone. */
+  private day(at: number) {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: this.config.timezone, dateStyle: 'short' }).format(at);
   }
   formatSource(message: Message) {
     const group = this.groups.find(g => g.id === message.chat_id)?.name || message.chat_id;
@@ -151,16 +159,20 @@ export class FamilyService {
                 if (!this.recipients.length || finding.priority === 'routine' || !finding.actionable || finding.confidence < this.config.alertMinConfidence) continue;
                 const freshSources = chunk.filter(m => finding.sources.includes(m.id));
                 if (!freshSources.length) continue; // Never alert on old context alone.
-                if (finding.dueAt && Date.parse(finding.dueAt) < now) continue;
+                // Compared by day, not by instant: a model given a date with no clock time
+                // answers midnight, and every same-day notice would read as already expired.
+                if (finding.dueAt && this.day(Date.parse(finding.dueAt)) < this.day(now)) continue;
                 const eventIdentity = finding.eventKey.trim().toLocaleLowerCase() || finding.sources.slice().sort().join(',');
                 const eventDay = finding.dueAt || new Date(Math.max(...freshSources.map(m => m.timestamp))).toISOString().slice(0, 10);
-                const fingerprint = hash(`${finding.title.trim().toLocaleLowerCase()}:${freshSources.map(m => m.text.trim().replace(/\s+/g, ' ')).sort().join('\n')}`);
+                // Scoped to the group: two children can be told the same thing on the same day
+                // in their own groups, and the second parent alert must not be read as a repeat.
+                const fingerprint = hash(`${group.id}:${finding.title.trim().toLocaleLowerCase()}:${freshSources.map(m => m.text.trim().replace(/\s+/g, ' ')).sort().join('\n')}`);
                 // The model is told to reuse an event's identity for follow-ups, so a cancellation
                 // or a corrected time carries the same (event, day) as the notice it replaces. The
                 // row is therefore keyed by content as well: identity alone would make the first
                 // alert about an event silence every later change to it, permanently, because
                 // nothing prunes this table while retentionDays is 0.
-                const id = hash(`${eventIdentity}:${eventDay}:${fingerprint}`);
+                const id = hash(`${group.id}:${eventIdentity}:${eventDay}:${fingerprint}`);
                 const window = now - 2 * 86400000;
                 const duplicate = this.store.db.prepare('SELECT id FROM alerts WHERE id=? OR (fingerprint=? AND created_at>?)')
                   .get(id, fingerprint, window);

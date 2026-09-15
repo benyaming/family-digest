@@ -296,8 +296,19 @@ export class WhatsApp {
     if (!this.service.chatIds.includes(chatId)) return;
     this.service.store.db.prepare('UPDATE messages SET text=?,analyzed=? WHERE chat_id=? AND external_id=?').run(text, +deleted, chatId, externalId);
   }
+  private connecting = false;
   async connect() {
-    if (this.stopping) return;
+    if (this.stopping || this.connecting) return;
+    this.connecting = true;
+    try {
+    // Whatever is here is being replaced: end it and disown it before another is built, or
+    // two live sockets share one auth store and a reconnect armed by the old one survives
+    // into the new session. Every handler is guarded by `socket !== this.socket`, which only
+    // holds once the old socket is no longer ours.
+    clearTimeout(this.timer);
+    const previous = this.socket;
+    this.socket = undefined;
+    previous?.end(undefined);
     this.status('connecting');
     const auth = sqliteAuth(this.service.store);
     // markOnlineOnConnect keeps the account from appearing online because of this app.
@@ -339,5 +350,6 @@ export class WhatsApp {
         this.timer = setTimeout(() => { void this.connect().catch(() => this.status('connection_failed')); }, wait);
       }
     });
+    } finally { this.connecting = false; }
   }
 }

@@ -174,7 +174,7 @@ export class Telegram {
         }
         if (action.toLowerCase() === 'remove') {
           const kid = service.findKid(value);
-          if (!kid) return 'Ребёнок не найден. /kids';
+          if (!kid) return service.family.length ? `Не понял, кто это. Напишите имя целиком: ${service.family.map(k => k.name).join(', ')}` : 'Детей пока нет. /kids';
           service.setFamily(service.family.filter(k => k.name !== kid.name));
           service.setGroups(service.groups.map(g => ({ ...g, children: g.children.filter(c => c !== kid.name) })));
           return `Ребёнок «${kid.name}» удалён. Группы остались, но больше ни к кому не привязаны.`;

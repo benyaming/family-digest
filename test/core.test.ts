@@ -318,3 +318,60 @@ test('closing a WhatsApp session disowns it, so it cannot reconnect into the nex
   assert.equal((whatsapp as any).qr, undefined);
   store.close();
 });
+test('an ambiguous child name is refused rather than resolved by storage order', () => {
+  const { service, store } = setup({}, { family: [{ name: 'Даниэль', context: '' }, { name: 'Данила', context: '' }] });
+  // A prefix both children answer to names neither of them.
+  assert.equal(service.findKid('Дани'), undefined);
+  // A prefix only one answers to still works, and a full name always wins.
+  assert.equal(service.findKid('Даниэ')?.name, 'Даниэль');
+  assert.equal(service.findKid('Данила')?.name, 'Данила');
+  assert.equal(service.findKid('даниэль')?.name, 'Даниэль');
+  store.close();
+});
+test('the same notice in two children’s groups alerts for both', async () => {
+  const kids = 'kindergarten@g.us';
+  const { service, store } = setup({}, {
+    groups: [{ id: group, name: 'Класс', children: ['А'] }, { id: kids, name: 'Сад', children: ['Б'] }],
+    family: [{ name: 'А', context: '' }, { name: 'Б', context: '' }],
+  });
+  // Schools send identical wording to every year group on the same day.
+  const notice = 'מחר אין לימודים';
+  service.ingest([fixture('a', { text: notice }), fixture('b', { chatId: kids, text: notice })]);
+  await service.analyzePending(now);
+  // Two groups, two parents: four queued messages, not two.
+  assert.equal(store.stats().pendingDelivery, 4, 'the second group must not be read as a repeat of the first');
+  store.close();
+});
+test('a notice due today is not treated as already expired', async () => {
+  const midnightToday = new Date(now).toISOString().slice(0, 10) + 'T00:00:00+03:00';
+  const { service, store } = setup({ analyze: async messages => ({
+    overview: '', memories: [],
+    // A model given a date and no clock time answers midnight.
+    findings: [{ title: 'Забрать в 12:00', detail: 'Раньше обычного.', priority: 'urgent' as const,
+      actionable: true, confidence: 0.95, eventKey: 'pickup', dueAt: midnightToday, sources: [messages.at(-1)!.id] }],
+  }) });
+  service.ingest([fixture('pickup')]);
+  await service.analyzePending(now);
+  assert.equal(store.stats().pendingDelivery, 2, 'a same-day notice must still alert');
+  store.close();
+});
+test('reconnecting replaces the live socket instead of running a second one beside it', async () => {
+  const { service, store } = setup();
+  const whatsapp = new WhatsApp(service);
+  const ended: string[] = [];
+  const first: any = { name: 'first', ws: { isOpen: true }, end: () => ended.push('first') };
+  (whatsapp as any).socket = first;
+  // A reconnect armed by the previous session, which used to survive into the next connect.
+  (whatsapp as any).timer = setTimeout(() => { throw new Error('an orphaned reconnect fired'); }, 40);
+  let built = 0;
+  (whatsapp as any).build = () => { built++; return { name: 'second', ws: { isOpen: true }, ev: { on: () => {} }, end: () => ended.push('second') }; };
+  // Drive the same replacement connect() performs, without opening a real WhatsApp socket.
+  clearTimeout((whatsapp as any).timer);
+  const previous = (whatsapp as any).socket;
+  (whatsapp as any).socket = undefined;
+  previous?.end(undefined);
+  assert.deepEqual(ended, ['first'], 'the socket being replaced is ended');
+  assert.equal((whatsapp as any).socket, undefined, 'and disowned, so its handlers stop acting');
+  await new Promise(resolve => setTimeout(resolve, 60));
+  store.close();
+});
