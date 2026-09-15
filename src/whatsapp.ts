@@ -294,10 +294,10 @@ export class WhatsApp {
   }
   private edit(chatId: string, externalId: string, text: string, deleted = false) {
     if (!this.service.chatIds.includes(chatId)) return;
-    // Reopening it for analysis without reopening the alert decision would mean an edited
-    // message is read again and can never be alerted on. A deletion is settled either way.
-    this.service.store.db.prepare('UPDATE messages SET text=?,analyzed=?,alerted=? WHERE chat_id=? AND external_id=?')
-      .run(text, +deleted, +deleted, chatId, externalId);
+    // The revision bump is what stops an analysis already running against the old text from
+    // completing this row: it claimed a revision that no longer exists. A deletion settles.
+    this.service.store.db.prepare('UPDATE messages SET text=?,analyzed=?,revision=revision+1 WHERE chat_id=? AND external_id=?')
+      .run(text, +deleted, chatId, externalId);
   }
   private connecting = false;
   async connect() {

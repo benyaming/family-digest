@@ -2,6 +2,9 @@ import { hash, Store } from './db.js';
 import type { Config, Group } from './config.js';
 import { ReplyError, type Analysis, type IncomingMessage, type Message, type Model } from './types.js';
 
+/** A unit whose messages changed under it while the model was running. */
+class StaleUnit extends Error {}
+
 export function chunkMessages(messages: Message[], max: number): Message[][] {
   const chunks: Message[][] = [];
   let batch: Message[] = [], size = 0;
@@ -135,6 +138,29 @@ export class FamilyService {
     else parts.push('\nОригинал сообщения: /source ID. Вложения без подписи не прочитаны.');
     return { text: parts.join('\n'), messageCount: messages.length, from, to };
   }
+  /**
+   * Groups pending messages into units of work. A unit owns whole messages, never parts of
+   * one: a message too large for a single model call gets a unit to itself, and its
+   * fragments are that unit's internal business. The unit is the transaction boundary, so
+   * what it decides is published together or not at all.
+   */
+  private planUnits(messages: Message[], max: number): Message[][] {
+    const units: Message[][] = [];
+    let unit: Message[] = [], size = 0;
+    for (const message of messages) {
+      const length = JSON.stringify(message).length;
+      if (length > max) {
+        if (unit.length) { units.push(unit); unit = []; size = 0; }
+        units.push([message]);
+        continue;
+      }
+      if (size + length > max && unit.length) { units.push(unit); unit = []; size = 0; }
+      unit.push(message); size += length;
+    }
+    if (unit.length) units.push(unit);
+    return units;
+  }
+
   async analyzePending(now = Date.now()) {
     if (this.analyzing) return;
     this.analyzing = true;
@@ -144,32 +170,37 @@ export class FamilyService {
       this.store.transaction(() => this.store.markAnalyzed(stale.map(m => m.id)));
       const failures: unknown[] = [];
       for (const group of this.groups) {
-        try {
-          const messages = pending.filter(m => m.chat_id === group.id && !stale.includes(m));
-          const chunks = chunkMessages(messages, this.config.chunkCharacters);
-          // chunkMessages splits a long message into parts that keep its id, so one message can
-          // span several chunks. It is only settled once its last part has been through.
-          const lastChunkOf = new Map<string, number>();
-          chunks.forEach((part, index) => part.forEach(m => lastChunkOf.set(m.id, index)));
-          for (const [index, chunk] of chunks.entries()) {
+        const targets = pending.filter(m => m.chat_id === group.id && !stale.includes(m));
+        for (const unit of this.planUnits(targets, this.config.chunkCharacters)) {
+          try {
             // Include a small recent conversation window so replies/corrections have context.
-            const start = Math.min(...chunk.map(m => m.timestamp));
+            const start = Math.min(...unit.map(m => m.timestamp));
             const earlier = this.store.db.prepare('SELECT * FROM messages WHERE chat_id=? AND timestamp>=? AND timestamp<? ORDER BY timestamp DESC,id DESC LIMIT 15')
               .all(group.id, start - 6 * 3600000, start) as unknown as Message[];
-            const boundedEarlier = earlier.filter(m => m.text.length < 2000);
-            const analysis = await this.model.analyze([...boundedEarlier, ...chunk], this.context(group, now));
-            // A later chunk failing leaves the whole group retryable, so this chunk can be
-            // analysed again after its alerts were already delivered. Whether a message has
-            // been alerted on is the one part of that decision the model cannot reword, so
-            // it is what the retry is judged against — not the title it happens to emit.
-            const settled = this.store.alerted(chunk.map(m => m.id));
+            const context = earlier.filter(m => m.text.length < 2000);
+            // A message larger than one model call is split here, inside the unit. Every
+            // fragment is analysed and their findings are collected into one decision, so an
+            // action in the first part and an unrelated one in the last both survive, and
+            // neither is published until the whole message has been read.
+            const analyses: Analysis[] = [];
+            for (const fragment of chunkMessages(unit, this.config.chunkCharacters)) {
+              analyses.push(await this.model.analyze([...context, ...fragment], this.context(group, now)));
+            }
             this.store.transaction(() => {
-              this.record(group, analysis, now);
-              if (group.alerts) for (const finding of analysis.findings) {
+              // The work was computed against these exact revisions. If any was edited or
+              // completed while the model was running, the whole unit is abandoned and the
+              // corrected text is left pending for a fresh analysis.
+              if (!this.store.completeUnit(unit.map(m => ({ id: m.id, revision: m.revision })),
+                context.map(m => ({ id: m.id, revision: m.revision })))) {
+                throw new StaleUnit();
+              }
+              for (const analysis of analyses) this.record(group, analysis, now);
+              if (!group.alerts) return;
+              const raised = new Set<string>();
+              for (const analysis of analyses) for (const finding of analysis.findings) {
                 if (!this.recipients.length || finding.priority === 'routine' || !finding.actionable || finding.confidence < this.config.alertMinConfidence) continue;
-                const freshSources = chunk.filter(m => finding.sources.includes(m.id) && !settled.has(m.id));
-                // Never alert on old context alone, nor on messages already alerted on.
-                if (!freshSources.length) continue;
+                const freshSources = unit.filter(m => finding.sources.includes(m.id));
+                if (!freshSources.length) continue; // Never alert on old context alone.
                 // Compared by day, not by instant: a model given a date with no clock time
                 // answers midnight, and every same-day notice would read as already expired.
                 // An unparseable deadline suppresses nothing — the schema's offset pattern
@@ -182,29 +213,27 @@ export class FamilyService {
                 // Scoped to the group: two children can be told the same thing on the same day
                 // in their own groups, and the second parent alert must not be read as a repeat.
                 const fingerprint = hash(`${group.id}:${finding.title.trim().toLocaleLowerCase()}:${freshSources.map(m => m.text.trim().replace(/\s+/g, ' ')).sort().join('\n')}`);
-                // The model is told to reuse an event's identity for follow-ups, so a cancellation
-                // or a corrected time carries the same (event, day) as the notice it replaces. The
-                // row is therefore keyed by content as well: identity alone would make the first
-                // alert about an event silence every later change to it, permanently, because
-                // nothing prunes this table while retentionDays is 0.
                 const id = hash(`${group.id}:${eventIdentity}:${eventDay}:${fingerprint}`);
-                const window = now - 2 * 86400000;
+                // Within this decision, the same event raised by two fragments is one alert.
+                if (raised.has(id)) continue;
+                raised.add(id);
+                // Across decisions this stays best effort: it suppresses a notice repeated
+                // verbatim, and deliberately does not veto a correction that reads differently.
                 const duplicate = this.store.db.prepare('SELECT id FROM alerts WHERE id=? OR (fingerprint=? AND created_at>?)')
-                  .get(id, fingerprint, window);
+                  .get(id, fingerprint, now - 2 * 86400000);
                 if (duplicate) continue;
                 this.store.db.prepare('INSERT INTO alerts VALUES(?,?,?,?)').run(id, now, finding.title, fingerprint);
                 const originals = freshSources.slice(0, 2).map(m => this.formatSource({ ...m, text: m.text.slice(0, 800) + (m.text.length > 800 ? '… (полный текст: /source ' + m.id + ')' : '') })).join('\n\n');
                 const text = `${finding.priority === 'urgent' ? '🚨 Срочно' : '🔔 Важно'} · ${group.name}\n${finding.title}\n${finding.detail}\n\nИсточник:\n${originals}`;
                 for (const recipient of this.recipients) this.store.enqueue(`alert:${id}`, recipient, text, false, finding.priority === 'urgent', now);
               }
-              // Decided now, whether or not anything was raised: a second pass over the same
-              // messages must not raise them again — but only for messages this chunk finishes.
-              if (group.alerts) this.store.markAlerted(chunk.filter(m => lastChunkOf.get(m.id) === index).map(m => m.id));
             });
+          } catch (error) {
+            // A unit that lost its race is not a failure worth reporting: its messages are
+            // still pending and the corrected text will be analysed on the next pass.
+            if (!(error instanceof StaleUnit)) failures.push(error);
           }
-          // A message may span chunks. A later failure must leave the whole group retryable.
-          this.store.transaction(() => this.store.markAnalyzed(messages.map(m => m.id)));
-        } catch (error) { failures.push(error); }
+        }
       }
       if (failures.length) throw new AggregateError(failures, 'One or more group analyses failed');
     } finally { this.analyzing = false; }

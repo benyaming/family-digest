@@ -390,68 +390,89 @@ test('a deadline the schema accepts but no clock can read suppresses nothing and
   assert.equal(store.stats().pendingAnalysis, 0, 'and the group was analysed rather than aborted');
   store.close();
 });
-test('a retried group does not alert twice, even when the model rewords the finding', async () => {
+test('a long notice is one decision: an action in its first part and another in its last both survive', async () => {
   let call = 0;
   const { service, store } = setup({ analyze: async messages => {
     call++;
-    // The group splits into several chunks. The first is analysed and its alerts commit; a
-    // later one fails, which by design leaves the whole group retryable — so the first chunk
-    // is analysed again, and the model does not word it the same way twice.
-    if (call % 2 === 0) throw new Error('offline');
-    const fresh = messages.at(-1)!;
-    return { overview: '', memories: [], findings: [{
-      title: call === 1 ? 'Экскурсия завтра' : 'Завтра экскурсия для класса',
-      detail: call === 1 ? 'Взять воду.' : 'Нужно взять воду и головной убор.',
-      priority: 'important' as const, actionable: true, confidence: 0.95,
-      eventKey: call === 1 ? 'trip-2026-09-08' : 'class-trip', dueAt: null, sources: [fresh.id],
-    }] };
-  } }, { chunkCharacters: 4000 });
-
-  service.ingest(Array.from({ length: 40 }, (_, i) => fixture(`m${i}`, { timestamp: now - 60000 + i })));
-  await assert.rejects(service.analyzePending(now), 'a later chunk fails');
-  const afterFirst = store.stats().pendingDelivery;
-  assert.equal(afterFirst, 2, 'the first chunk alerted both parents');
-  assert.equal(store.stats().pendingAnalysis, 40, 'and the group stayed retryable');
-
-  await assert.rejects(service.analyzePending(now));
-  assert.equal(store.stats().pendingDelivery, afterFirst,
-    'the retry re-analysed the same messages and must not alert on them again');
-  store.close();
-});
-test('an edited message can be alerted on again, and a deleted one cannot', async () => {
-  const { service, store } = setup();
-  service.ingest([fixture('notice')]);
-  await service.analyzePending(now);
-  assert.equal(store.stats().pendingDelivery, 2, 'the original alerted');
-  const row = () => store.db.prepare('SELECT analyzed, alerted FROM messages WHERE external_id=?').get('notice') as any;
-  assert.deepEqual([row().analyzed, row().alerted], [1, 1]);
-
-  // A teacher corrects the amount. Being re-read is useless if it can never be raised again.
-  store.db.prepare('UPDATE messages SET text=?,analyzed=?,alerted=? WHERE external_id=?')
-    .run('מחר טיול, להביא 100 ש"ח', 0, 0, 'notice');
-  await service.analyzePending(now);
-  assert.equal(store.stats().pendingDelivery, 4, 'the correction reaches both parents');
-
-  // A deletion is settled: re-opened for analysis, never alerted on.
-  store.db.prepare('UPDATE messages SET text=?,analyzed=?,alerted=? WHERE external_id=?')
-    .run('[Сообщение удалено]', 1, 1, 'notice');
-  await service.analyzePending(now);
-  assert.equal(store.stats().pendingDelivery, 4, 'a deletion raises nothing');
-  store.close();
-});
-test('a message long enough to span chunks is not silenced after its first part', async () => {
-  const seen: string[][] = [];
-  const { service, store } = setup({ analyze: async messages => {
-    seen.push(messages.map(m => m.id));
+    const source = messages.at(-1)!.id;
+    // The same message, read in fragments. Two unrelated actions, far apart in the text.
+    if (call === 1) return { overview: '', memories: [], findings: [{ title: 'Забрать в 12:00', detail: 'Раньше обычного.',
+      priority: 'urgent' as const, actionable: true, confidence: 0.95, eventKey: 'pickup', dueAt: null, sources: [source] }] };
+    if (call === 5) return { overview: '', memories: [], findings: [{ title: 'Оплатить автобус', detail: '50 шекелей.',
+      priority: 'important' as const, actionable: true, confidence: 0.95, eventKey: 'bus', dueAt: null, sources: [source] }] };
     return { overview: '', memories: [], findings: [] };
   } }, { chunkCharacters: 4000 });
-  // One message, split into parts that keep its id and land in separate chunks.
   service.ingest([fixture('long', { text: 'א'.repeat(15000) })]);
   await service.analyzePending(now);
-  assert.ok(seen.length > 1, 'the message really did span chunks');
-  const settled = store.db.prepare('SELECT alerted FROM messages WHERE external_id=?').get('long') as any;
-  assert.equal(settled.alerted, 1, 'and is settled once, after its last part');
-  // Every part was still offered to the model rather than being excluded partway through.
-  assert.equal(seen.filter(ids => ids.includes(seen[0]![0]!)).length, seen.length);
+  assert.equal(call, 5, 'the message really did need five model calls');
+  // Two findings, both parents: four queued. Neither part silences the other.
+  assert.equal(store.stats().pendingDelivery, 4);
+  const texts = (store.db.prepare('SELECT text FROM outbox').all() as any[]).map(r => r.text).join('\n');
+  assert.match(texts, /Забрать в 12:00/); assert.match(texts, /Оплатить автобус/);
+  assert.equal(store.stats().pendingAnalysis, 0, 'and the message is settled once, as a whole');
+  store.close();
+});
+test('a unit that fails partway publishes nothing, and its retry publishes once', async () => {
+  let attempt = 0, calls = 0;
+  const { service, store } = setup({ analyze: async messages => {
+    calls++;
+    // The first attempt dies on a later fragment; the second succeeds, worded differently.
+    if (attempt === 0 && calls >= 3) throw new Error('offline');
+    const source = messages.at(-1)!.id;
+    return { overview: '', memories: [], findings: [{
+      title: attempt === 0 ? 'Экскурсия завтра' : 'Завтра экскурсия для класса',
+      detail: 'Взять воду.', priority: 'important' as const, actionable: true, confidence: 0.95,
+      eventKey: attempt === 0 ? 'trip' : 'class-trip', dueAt: null, sources: [source] }] };
+  } }, { chunkCharacters: 4000 });
+  service.ingest([fixture('long', { text: 'א'.repeat(15000) })]);
+
+  await assert.rejects(service.analyzePending(now));
+  assert.equal(store.stats().pendingDelivery, 0, 'a half-read notice publishes nothing');
+  assert.equal(store.db.prepare('SELECT count(*) n FROM alerts').get()!.n, 0);
+  assert.equal(store.db.prepare('SELECT count(*) n FROM analyses').get()!.n, 0, 'and records nothing');
+  assert.equal(store.stats().pendingAnalysis, 1, 'the message stays pending');
+
+  attempt = 1; calls = 0;
+  await service.analyzePending(now);
+  // Reworded on the retry, which is exactly what text-based de-duplication could not survive.
+  assert.equal(store.stats().pendingDelivery, 2, 'the retry publishes once');
+  store.close();
+});
+test('a message edited while the model is running abandons that analysis rather than publishing it', async () => {
+  let release: (() => void) | undefined;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const { service, store } = setup({ analyze: async messages => {
+    await held;
+    return analysis(messages);
+  } });
+  service.ingest([fixture('notice')]);
+  const running = service.analyzePending(now);
+  // The teacher corrects the amount while the model is still reading the old text.
+  await new Promise(resolve => setTimeout(resolve, 20));
+  store.db.prepare('UPDATE messages SET text=?,analyzed=0,revision=revision+1 WHERE external_id=?')
+    .run('מחר טיול, להביא 100 ש"ח', 'notice');
+  release!();
+  await running;
+  assert.equal(store.stats().pendingDelivery, 0, 'nothing is published about text that has changed');
+  assert.equal(store.db.prepare('SELECT count(*) n FROM analyses').get()!.n, 0, 'and nothing is recorded');
+  assert.equal(store.stats().pendingAnalysis, 1, 'the corrected text is left to be analysed');
+  assert.equal((store.db.prepare('SELECT revision FROM messages WHERE external_id=?').get('notice') as any).revision, 2);
+
+  // The next pass sees the correction and alerts on it.
+  await service.analyzePending(now);
+  assert.equal(store.stats().pendingDelivery, 2);
+  store.close();
+});
+test('an already completed message cannot be completed twice', () => {
+  const { service, store } = setup();
+  service.ingest([fixture('a'), fixture('b')]);
+  const rows = store.pending([group]);
+  const targets = rows.map(m => ({ id: m.id, revision: m.revision }));
+  assert.equal(store.completeUnit(targets), true, 'the first claim succeeds');
+  assert.equal(store.completeUnit(targets), false, 'the second finds nothing pending at that revision');
+  // A stale revision is refused even when the row is pending again.
+  store.db.prepare('UPDATE messages SET analyzed=0,revision=revision+1').run();
+  assert.equal(store.completeUnit(targets), false, 'and a superseded revision is refused');
+  assert.equal(store.completeUnit(store.pending([group]).map(m => ({ id: m.id, revision: m.revision }))), true);
   store.close();
 });

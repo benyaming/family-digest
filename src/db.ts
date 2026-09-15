@@ -29,7 +29,7 @@ export class Store {
         id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, external_id TEXT NOT NULL,
         sender TEXT NOT NULL, timestamp INTEGER NOT NULL, text TEXT NOT NULL,
         kind TEXT NOT NULL, historical INTEGER NOT NULL, analyzed INTEGER NOT NULL DEFAULT 0,
-        alerted INTEGER NOT NULL DEFAULT 0,
+        alerted INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1,
         UNIQUE(chat_id, external_id)
       );
       CREATE INDEX IF NOT EXISTS messages_time ON messages(timestamp, chat_id);
@@ -54,7 +54,7 @@ export class Store {
       );
     `);
     // Databases created before onboarding moved into Telegram predate the photo column.
-    if (Number((this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version) < 5) {
+    if (Number((this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version) < 6) {
       const columns = this.db.prepare('PRAGMA table_info(outbox)').all() as { name: string }[];
       if (!columns.some(c => c.name === 'photo')) this.db.exec('ALTER TABLE outbox ADD COLUMN photo TEXT');
       if (!columns.some(c => c.name === 'markup')) this.db.exec('ALTER TABLE outbox ADD COLUMN markup TEXT');
@@ -66,7 +66,17 @@ export class Store {
         this.db.exec('ALTER TABLE messages ADD COLUMN alerted INTEGER NOT NULL DEFAULT 0');
         this.db.exec('UPDATE messages SET alerted=1 WHERE analyzed=1');
       }
-      this.db.exec('PRAGMA user_version=5');
+      // An application-owned version of the row, bumped by every effective edit. A result
+      // computed against one revision must not be allowed to complete another, and a text
+      // hash cannot express that: an A → B → A edit would make a stale result look current.
+      if (!messageColumns.some(c => c.name === 'revision')) {
+        this.db.exec('ALTER TABLE messages ADD COLUMN revision INTEGER NOT NULL DEFAULT 1');
+        // A message settled under the old rules but left unanalysed is a long notice that was
+        // partly emitted. The flags cannot say how much, so it is settled rather than replayed:
+        // missing the rest of one old notice beats alerting the family about it twice.
+        this.db.exec('UPDATE messages SET analyzed=1 WHERE alerted=1 AND analyzed=0');
+      }
+      this.db.exec('PRAGMA user_version=6');
     }
   }
   close() { this.db.close(); }
@@ -98,21 +108,25 @@ export class Store {
     // Take turns between chats. A chat whose messages keep failing analysis holds its
     // backlog at the front of the queue, and a global oldest-first window would let it
     // starve newer messages in every other chat until that backlog ages out.
-    return this.db.prepare(`SELECT id,chat_id,external_id,sender,timestamp,text,kind,historical,analyzed FROM (
+    return this.db.prepare(`SELECT id,chat_id,external_id,sender,timestamp,text,kind,historical,analyzed,revision FROM (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY timestamp,id) turn FROM messages
         WHERE analyzed=0 AND historical=0 AND chat_id IN (${chats.map(() => '?')})
       ) ORDER BY turn,timestamp,id LIMIT ?`)
       .all(...chats, limit) as unknown as Message[];
   }
-  /** Records that a message's alerts have been decided, so a retry cannot decide them again. */
-  markAlerted(ids: string[]) {
-    const stmt = this.db.prepare('UPDATE messages SET alerted=1 WHERE id=?');
-    ids.forEach(id => stmt.run(id));
-  }
-  alerted(ids: string[]): Set<string> {
-    if (!ids.length) return new Set();
-    return new Set((this.db.prepare(`SELECT id FROM messages WHERE alerted=1 AND id IN (${ids.map(() => '?')})`)
-      .all(...ids) as { id: string }[]).map(r => r.id));
+  /**
+   * Completes exactly the message revisions a unit of work claimed, or reports that it cannot.
+   * Every target must still be pending at the revision the work was computed against; if one
+   * was edited or already completed while the model was running, the caller rolls the whole
+   * unit back rather than publishing a decision about text that has since changed.
+   */
+  completeUnit(targets: { id: string; revision: number }[], context: { id: string; revision: number }[] = []) {
+    const complete = this.db.prepare('UPDATE messages SET analyzed=1 WHERE id=? AND revision=? AND analyzed=0');
+    for (const target of targets) if (complete.run(target.id, target.revision).changes !== 1) return false;
+    // Context is evidence the unit did not own, so only its identity has to still hold.
+    const unchanged = this.db.prepare('SELECT 1 FROM messages WHERE id=? AND revision=?');
+    for (const row of context) if (!unchanged.get(row.id, row.revision)) return false;
+    return true;
   }
   markAnalyzed(ids: string[]) {
     const stmt = this.db.prepare('UPDATE messages SET analyzed=1 WHERE id=?');
