@@ -184,7 +184,6 @@ export class WhatsApp {
   // looks uniformly unarchived; asking for a full snapshot recovers it without re-pairing.
   async resyncChats() {
     const socket = await this.socketReady();
-    this.service.store.set('wa:chatsSynced', true);
     // Two halves have to be true at once. Baileys only refetches patches newer than the
     // version it has stored, so the stored versions are dropped to force a full snapshot.
     // And an "initial" sync makes every archive update conditional on the chat arriving in
@@ -201,6 +200,7 @@ export class WhatsApp {
       seen = known;
       await new Promise(resolve => setTimeout(resolve, 250));
     }
+    this.service.store.set('wa:chatsSynced', true);
     return Object.keys(this.chatMeta()).length;
   }
   async unlink() {
@@ -209,9 +209,13 @@ export class WhatsApp {
     this.stop();
     this.service.store.db.exec('DELETE FROM wa_auth');
     this.service.store.set('wa:groups', []);
+    this.service.store.set('wa:groupsAt', 0);
     this.service.store.set('wa:chatmeta', {});
     this.service.store.set('wa:chatsSynced', false);
     this.status('disabled');
+    // Let the socket finish closing before anything is allowed to open a new one, or a
+    // reconnect scheduled by the old session races the next link.
+    await new Promise(resolve => setTimeout(resolve, 250));
     this.stopping = false;
   }
   groups() { return this.service.store.get<{ id: string; name: string }[]>('wa:groups', []); }
@@ -226,13 +230,16 @@ export class WhatsApp {
     let changed = false;
     for (const chat of chats) {
       if (!chat.id) continue;
+      // Tracked per chat: a single earlier change used to make every later chat store an
+      // empty entry, which then counted as "known" and was never filled in.
+      let touched = false;
       const entry = meta[chat.id] ?? {};
-      if (chat.archived !== undefined && chat.archived !== null && entry.a !== !!chat.archived) { entry.a = !!chat.archived; changed = true; }
+      if (chat.archived !== undefined && chat.archived !== null && entry.a !== !!chat.archived) { entry.a = !!chat.archived; touched = true; }
       const raw = chat.conversationTimestamp as { toNumber?: () => number } | number | null | undefined;
       const seconds = typeof raw === 'object' && raw?.toNumber ? raw.toNumber() : Number(raw ?? 0);
       const at = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;
-      if (at && at !== entry.t) { entry.t = at; changed = true; }
-      if (changed) meta[chat.id] = entry;
+      if (at && at !== entry.t) { entry.t = at; touched = true; }
+      if (touched) { meta[chat.id] = entry; changed = true; }
     }
     if (changed) this.service.store.set('wa:chatmeta', meta);
   }
@@ -266,11 +273,14 @@ export class WhatsApp {
     const pending = new Set(this.service.store.get<string[]>('wa:backfill', []));
     if (!pending.has(chatId) || this.backfilling.has(chatId)) return;
     this.backfilling.add(chatId);
-    pending.delete(chatId);
-    this.service.store.set('wa:backfill', [...pending]);
     void (async () => {
-      try { await this.socket?.fetchMessageHistory(100, key, timestamp); }
-      catch { /* history is a bonus: the group still works going forward without it */ }
+      try {
+        await this.socket?.fetchMessageHistory(100, key, timestamp);
+        // Only now is the intent spent. Clearing it first meant one failed request — a
+        // reconnect mid-flight, say — silently cost the group its history for good.
+        pending.delete(chatId);
+        this.service.store.set('wa:backfill', [...pending]);
+      } catch { /* history is a bonus: the group still works going forward without it */ }
       finally { this.backfilling.delete(chatId); }
     })();
   }

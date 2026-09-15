@@ -184,7 +184,11 @@ test('Hermes MCP handshake discovers tools and reads authenticated service throu
   try {
     await client.connect(transport);
     const tools = await client.listTools(); assert.equal(tools.tools.length, 8);
-    assert.ok(tools.tools.every(t => t.annotations?.readOnlyHint));
+    // Reading is annotated read-only; the two that call the model and persist what it returns
+  // are not, so a caller cannot treat them as free to retry.
+  const writing = tools.tools.filter(t => !t.annotations?.readOnlyHint).map(t => t.name).sort();
+  assert.deepEqual(writing, ['family_ask', 'family_summary']);
+  assert.ok(tools.tools.filter(t => !writing.includes(t.name)).every(t => t.annotations?.readOnlyHint));
     const result = await client.callTool({ name: 'family_status', arguments: {} });
     assert.equal(result.isError, undefined); assert.match(JSON.stringify(result.content), /messages/);
   } finally { await client.close(); await app.close(); store.close(); }
@@ -207,6 +211,7 @@ test('asking for the chat list re-reads groups from WhatsApp', async () => {
   const { service, store } = setup({}, { groups: [] });
   const wa = fakeWhatsApp([{ id: 'a@g.us', name: 'כיתה ג3' }]);
   const bot = new Telegram(service, telegramEnv, undefined, wa.control);
+  store.set('wa:status', 'connected');
   await bot.command('/kid add Даниэль');
   assert.doesNotMatch(await bot.command('/chats'), /חוג/);
   // A group joined after linking appears without a reconnect or a separate refresh command.
@@ -823,6 +828,12 @@ test('opening the chat list fetches the chat snapshot once, without being asked'
   const { service, store } = setup({}, { groups: [], family: [] });
   const wa = fakeWhatsApp([{ id: 'a@g.us', name: 'Класс' }]);
   const menu = new Menu(service, wa.control);
+  // Looking at the list before linking must not spend the one attempt, nor start WhatsApp.
+  await menu.groups('11');
+  assert.deepEqual(wa.calls, ['refresh'], 'nothing is asked of an unlinked account');
+  assert.equal(store.get('wa:chatsSynced', false), false, 'and the one attempt is still available');
+  wa.calls.length = 0;
+  store.set('wa:status', 'connected');
   await menu.groups('11');
   assert.deepEqual(wa.calls, ['resync', 'refresh'], 'the snapshot is asked for before the list is drawn');
   // It is not cheap, so it does not repeat on every listing.
@@ -838,6 +849,7 @@ test('opening the chat list fetches the chat snapshot once, without being asked'
   wa.control.resyncChats = async () => { throw new Error('offline'); };
   const listing = await menu.groups('11');
   assert.match(listing.text, /Класс/);
+  assert.equal(store.get('wa:chatsSynced', false), false, 'a failure does not consume the one attempt');
   store.close();
 });
 test('slow work shows a typing indicator, refreshed until it finishes, then stopped', async () => {

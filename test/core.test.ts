@@ -203,8 +203,14 @@ test('the WhatsApp socket cannot write: every write method throws instead of rea
   assert.equal(await socket.logout(), 'logged out');
   assert.equal(await (socket as any).resyncAppState(['regular'], true), 'resynced');
   assert.equal(await (socket as any).fetchMessageHistory(100, { id: 'x' }, 1), 'requested');
-  // The allow-list is exactly this and nothing more.
-  assert.deepEqual(allowed.filter(name => { try { (socket as any)[name]; return true; } catch { return false; } }).sort(), [...allowed].sort());
+  // The allow-list is exactly this and nothing more: everything else on the socket, whatever
+  // Baileys adds later, must come back blocked rather than callable.
+  const reachable = Object.keys(raw).filter(name => {
+    const value = (socket as any)[name];
+    if (typeof value !== 'function') return false;
+    try { value(); return true; } catch { return false; }
+  });
+  assert.deepEqual(reachable.sort(), [...allowed].sort());
 
   // Data that is not needed is not exposed, and the guard cannot be patched away.
   assert.equal((socket as any).user, undefined);
@@ -265,4 +271,35 @@ test('the write guard cannot be walked around by descriptor reads or the raw tra
   // Nothing above reached the underlying socket.
   assert.deepEqual(reached, []);
   assert.equal(await (socket as any).requestPairingCode('972500000000'), 'CODE');
+});
+test('a correction to an event still alerts after the original notice was sent', async () => {
+  const notices = [
+    { title: 'Экскурсия завтра', detail: 'Взять воду.', text: 'מחר טיול, להביא מים' },
+    { title: 'Экскурсия отменена', detail: 'Поездка отменена.', text: 'הטיול מחר מבוטל' },
+  ];
+  let step = 0;
+  const { service, store } = setup({ analyze: async messages => ({
+    overview: '', memories: [],
+    // The prompt tells the model to reuse an event's identity for follow-ups, so a
+    // cancellation arrives under the same eventKey and the same day as the notice it undoes.
+    findings: [{ title: notices[step]!.title, detail: notices[step]!.detail, priority: 'important' as const,
+      actionable: true, confidence: 0.95, eventKey: 'class-trip-2026-09-08',
+      dueAt: '2026-09-08T07:00:00+03:00', sources: [messages.at(-1)!.id] }],
+  }) });
+  service.ingest([fixture('notice', { text: notices[0]!.text })]);
+  await service.analyzePending(now);
+  assert.equal(store.stats().pendingDelivery, 2, 'the original notice alerts both parents');
+
+  step = 1;
+  service.ingest([fixture('correction', { text: notices[1]!.text, timestamp: now - 30000 })]);
+  await service.analyzePending(now);
+  assert.equal(store.stats().pendingDelivery, 4, 'the cancellation must reach them too');
+  assert.match(store.db.prepare('SELECT text FROM outbox ORDER BY rowid DESC LIMIT 1').get()!.text as string, /отменена/);
+
+  // The same notice arriving twice is still suppressed: identity plus content, not identity alone.
+  step = 0;
+  service.ingest([fixture('repeat', { text: notices[0]!.text, timestamp: now - 20000 })]);
+  await service.analyzePending(now);
+  assert.equal(store.stats().pendingDelivery, 4, 'an identical repeat is still deduplicated');
+  store.close();
 });

@@ -16,8 +16,8 @@ const token = (value: string) => hash(value).slice(0, 12);
 
 const screen = (text: string, rows: Button[][], parseMode?: string): Screen => ({ text, markup: { inline_keyboard: rows }, ...(parseMode ? { parseMode } : {}) });
 const back = (to: string): Button => ({ text: '← Назад', callback_data: to });
-// Callback payloads are capped at 64 bytes, so screens address kids and groups by position
-// in the list they were drawn from rather than by name or JID.
+// Callback payloads are capped at 64 bytes, which a JID would fit but a child's name might
+// not — so screens carry a short digest of the identity and resolve it against stored state.
 const rows = (buttons: Button[], perRow = 1) =>
   buttons.reduce<Button[][]>((acc, b, i) => (i % perRow ? acc[acc.length - 1]!.push(b) : acc.push([b]), acc), []);
 
@@ -60,11 +60,19 @@ export class Menu {
 
   async groups(chatId: string, page = 0, force = false): Promise<Screen> {
     // The chat snapshot is what makes archive state and ordering correct, and it is only
-    // replayed on request. Ask for it the first time the list is opened after linking, so
-    // the reader never has to know that a sync exists. Once per link: it is not cheap.
-    if (this.whatsapp && !this.store.get('wa:chatsSynced', false)) {
-      this.store.set('wa:chatsSynced', true);
-      try { await this.whatsapp.resyncChats(); } catch { /* the list is still usable without it */ }
+    // replayed on request. Ask for it the first time the list is opened with a live session,
+    // so the reader never has to know that a sync exists. Once per link: it is not cheap.
+    // Opening this screen before linking must not spend that one attempt — and must not
+    // start WhatsApp either, which is what asking for it would do.
+    if (this.whatsapp && this.store.get<string>('wa:status', 'disabled') === 'connected'
+      && !this.store.get('wa:chatsSynced', false)) {
+      // Marked here, by the caller that owns the once-per-link policy, and only once the
+      // request returned: a failure that consumed the attempt would leave archive state and
+      // ordering permanently empty, with nothing short of unlinking to recover it.
+      try {
+        await this.whatsapp.resyncChats();
+        this.store.set('wa:chatsSynced', true);
+      } catch { /* the list is still usable without it */ }
     }
     const watched = this.service.groups;
     const available = await (this.whatsapp?.refreshGroups(force) ?? Promise.resolve([]));

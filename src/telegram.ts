@@ -80,6 +80,8 @@ export class Telegram {
       await this.erase(chatId, qr.id);
       store.set('wa:qrMessage', null);
     }
+    // Pairing is finished, so a later reconnect is not something anyone asked to be told about.
+    store.set('wa:pairingChat', null);
     const count = this.whatsapp?.groups().length ?? 0;
     const screen = await this.menu.route('groups', chatId);
     await this.renderMenu(chatId, `linked:${Date.now()}`, {
@@ -230,6 +232,10 @@ export class Telegram {
       case '/link': {
         if (!this.whatsapp) return 'Управление WhatsApp недоступно.';
         if (!args) return 'Подключение WhatsApp:\n/link +9725XXXXXXXX — код из 8 символов\n/link qr — QR-код картинкой';
+        // announceLinked() confirms the link and clears the spent QR in this chat, and it has no
+        // other way to know which chat asked. Without this the documented typed path pairs
+        // successfully and then says nothing at all.
+        store.set('wa:pairingChat', chatId);
         try {
           if (args.toLowerCase() === 'qr') {
             const value = await this.whatsapp.pairingQr();
@@ -374,7 +380,12 @@ export class Telegram {
       let reply: string;
       const stop = this.working(chatId);
       try { reply = await this.command(text, chatId, direct); }
-      catch { reply = 'Не удалось выполнить запрос. Проверьте /status и настройки модели, затем повторите запрос. Для большой сводки попробуйте более короткий период.'; }
+      catch (e) {
+        // A command that rejected the reader's own input explains why; only an unexpected
+        // failure gets the generic text, which would otherwise bury "период: 24h, 48h или 7d".
+        const explained = e instanceof Error && !(e instanceof TelegramError) && e.message.length <= 200 ? e.message : '';
+        reply = explained || 'Не удалось выполнить запрос. Проверьте /status и настройки модели, затем повторите запрос. Для большой сводки попробуйте более короткий период.';
+      }
       finally { stop(); }
       store.transaction(() => {
         store.enqueue(`reply:${update.update_id}`, chatId, reply, false, true, Date.now(),
@@ -438,7 +449,6 @@ export class Telegram {
             this.service.store.set(`menu:${chatId}`, result?.message_id ?? null);
           }
           else await this.call('sendMessage', { chat_id: chatId, text: row.text, disable_notification: !!row.silent, link_preview_options: { is_disabled: true },
-            ...(row.markup ? { reply_markup: JSON.parse(String(row.markup)) } : {}),
             ...(row.parse_mode ? { parse_mode: String(row.parse_mode) } : {}) });
           db.prepare('UPDATE outbox SET sent_at=?,last_error=NULL WHERE id=?').run(now, String(row.id));
           this.lastSend = Date.now();

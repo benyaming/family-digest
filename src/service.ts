@@ -39,9 +39,9 @@ export class FamilyService {
     return selected.map(g => {
       const seed = this.config.groups.find(c => c.id === g.id);
       if (!seed) return g;
-      return { ...g, name: seed.name || g.name,
-        children: g.children.length ? g.children : seed.children,
-        context: g.context || seed.context };
+      // Children are assigned in the chat and deleting one empties them here, so the file
+      // must not put them back; it seeds a group's name and note, nothing that is managed.
+      return { ...g, name: seed.name || g.name, context: g.context || seed.context };
     });
   }
   setGroups(groups: Group[]) {
@@ -152,11 +152,18 @@ export class FamilyService {
                 const freshSources = chunk.filter(m => finding.sources.includes(m.id));
                 if (!freshSources.length) continue; // Never alert on old context alone.
                 if (finding.dueAt && Date.parse(finding.dueAt) < now) continue;
-                const event = finding.eventKey.trim().toLocaleLowerCase();
+                const eventIdentity = finding.eventKey.trim().toLocaleLowerCase() || finding.sources.slice().sort().join(',');
                 const eventDay = finding.dueAt || new Date(Math.max(...freshSources.map(m => m.timestamp))).toISOString().slice(0, 10);
-                const id = hash(`${event || finding.sources.slice().sort().join(',')}:${eventDay}`);
                 const fingerprint = hash(`${finding.title.trim().toLocaleLowerCase()}:${freshSources.map(m => m.text.trim().replace(/\s+/g, ' ')).sort().join('\n')}`);
-                const duplicate = this.store.db.prepare('SELECT id FROM alerts WHERE id=? OR (fingerprint=? AND created_at>?)').get(id, fingerprint, now - 2 * 86400000);
+                // The model is told to reuse an event's identity for follow-ups, so a cancellation
+                // or a corrected time carries the same (event, day) as the notice it replaces. The
+                // row is therefore keyed by content as well: identity alone would make the first
+                // alert about an event silence every later change to it, permanently, because
+                // nothing prunes this table while retentionDays is 0.
+                const id = hash(`${eventIdentity}:${eventDay}:${fingerprint}`);
+                const window = now - 2 * 86400000;
+                const duplicate = this.store.db.prepare('SELECT id FROM alerts WHERE id=? OR (fingerprint=? AND created_at>?)')
+                  .get(id, fingerprint, window);
                 if (duplicate) continue;
                 this.store.db.prepare('INSERT INTO alerts VALUES(?,?,?,?)').run(id, now, finding.title, fingerprint);
                 const originals = freshSources.slice(0, 2).map(m => this.formatSource({ ...m, text: m.text.slice(0, 800) + (m.text.length > 800 ? '… (полный текст: /source ' + m.id + ')' : '') })).join('\n\n');

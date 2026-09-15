@@ -36,12 +36,12 @@ The WhatsApp client only ingests the group IDs you have selected. The AI receive
 
 ### It cannot write to WhatsApp
 
-The linked account is read-only by construction, not by convention. Baileys exposes 170 methods on its socket, 77 of which change something on WhatsApp's side — sending messages, read receipts, presence, group administration, profile edits, blocking. The socket is wrapped in an allow-list proxy that permits exactly seven things:
+The linked account is read-only by construction, not by convention. Baileys exposes 170 methods on its socket, 77 of which change something on WhatsApp's side — sending messages, read receipts, group administration, profile edits, blocking. The guard governs what *this app* can call; it does not sit between Baileys and the network, so the protocol traffic any linked device sends is unaffected either way. The socket is wrapped in an allow-list proxy that permits nine things, and nothing else:
 
 | Allowed | Why |
 |---|---|
 | `ev` | receive events |
-| `ws` | connection state only |
+| `ws` | a live `isOpen` view, never the raw transport — its `send()` is unreachable |
 | `authState` | is this device registered |
 | `end` | close the connection locally |
 | `requestPairingCode` | link this device |
@@ -71,7 +71,7 @@ curl -o .env https://raw.githubusercontent.com/OWNER/family-brief/main/.env.exam
 docker compose -f compose.prod.yaml up -d
 ```
 
-No configuration file is needed. Children, groups and notes are managed from Telegram and stored in the database, so a fresh deployment needs only the environment and a volume; `compose.prod.yaml` deliberately leaves `CONFIG_PATH` unset. A `config.json` is still read if you mount one, which is useful for seeding per-group `context` and `children`.
+No configuration file is needed. Children, groups and notes are managed from Telegram and stored in the database, so a fresh deployment needs only the environment and a volume; `compose.prod.yaml` deliberately leaves `CONFIG_PATH` unset. A `config.json` is still read if you mount one, which is useful for seeding a group's `name` and `context`.
 
 The container runs as a non-root user on a read-only root filesystem with all capabilities dropped, and publishes its port on loopback only. Point your existing reverse proxy at `127.0.0.1:8080` if you want the API reachable; nothing outside the VPS needs to reach it for Telegram or WhatsApp to work, since both are outbound connections.
 
@@ -176,7 +176,7 @@ Your direct chat needs no extra configuration: a private chat's ID is your own u
 
 Typing still works for everything — `/kids`, `/watch 2 Даниэль`, `/note 2 текст` — and any plain sentence is treated as a question. The buttons exist so you never need to know that.
 
-Selected groups live in the database, so `config.json` is only a seed plus optional per-group detail. Adding `children` and `context` there for a group ID measurably improves digests, and those values survive re-selecting the group from chat. No message history is stored for groups you have not selected. This example uses invented names and a placeholder group ID:
+Selected groups live in the database, so `config.json` is only a seed plus optional per-group detail. Adding `context` there for a group ID measurably improves digests, and it survives re-selecting the group from chat. Children are not seeded from the file: they are assigned in the chat, and removing a child empties the assignment — a file that put it back would resurrect a child you deleted. No message history is stored for groups you have not selected. This example uses invented names and a placeholder group ID:
 
 ```json
 {
@@ -189,7 +189,6 @@ Selected groups live in the database, so `config.json` is only a seed plus optio
     {
       "id": "REPLACE_WITH_REAL_GROUP_ID@g.us",
       "name": "Школа — класс Даниэля",
-      "children": ["Даниэль / דניאל"],
       "context": "Группа родителей класса ב2. Сообщения учителя часто пересылает представитель родителей.",
       "alerts": true
     }
