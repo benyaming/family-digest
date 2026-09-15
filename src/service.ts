@@ -91,7 +91,7 @@ export class FamilyService {
     if (!matches.length) throw new ReplyError('Группа не найдена. Используйте /chats.');
     return matches;
   }
-  /** The calendar day an instant falls on, in the family's own timezone. */
+  /** The calendar day a finite instant falls on, in the family's own timezone. */
   private day(at: number) {
     return new Intl.DateTimeFormat('en-CA', { timeZone: this.config.timezone, dateStyle: 'short' }).format(at);
   }
@@ -161,7 +161,11 @@ export class FamilyService {
                 if (!freshSources.length) continue; // Never alert on old context alone.
                 // Compared by day, not by instant: a model given a date with no clock time
                 // answers midnight, and every same-day notice would read as already expired.
-                if (finding.dueAt && this.day(Date.parse(finding.dueAt)) < this.day(now)) continue;
+                // An unparseable deadline suppresses nothing — the schema's offset pattern
+                // accepts values Date.parse cannot read, and a malformed one is not evidence
+                // that the notice has passed.
+                const due = finding.dueAt ? Date.parse(finding.dueAt) : Number.NaN;
+                if (Number.isFinite(due) && this.day(due) < this.day(now)) continue;
                 const eventIdentity = finding.eventKey.trim().toLocaleLowerCase() || finding.sources.slice().sort().join(',');
                 const eventDay = finding.dueAt || new Date(Math.max(...freshSources.map(m => m.timestamp))).toISOString().slice(0, 10);
                 // Scoped to the group: two children can be told the same thing on the same day

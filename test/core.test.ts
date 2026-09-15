@@ -375,3 +375,18 @@ test('reconnecting replaces the live socket instead of running a second one besi
   await new Promise(resolve => setTimeout(resolve, 60));
   store.close();
 });
+test('a deadline the schema accepts but no clock can read suppresses nothing and crashes nothing', async () => {
+  // zod's datetime({offset:true}) accepts an out-of-range offset; Date.parse returns NaN.
+  const unreadable = '2026-09-16T08:00:00+03:99';
+  const { service, store } = setup({ analyze: async messages => ({
+    overview: '', memories: [],
+    findings: [{ title: 'Забрать раньше', detail: 'Сегодня в 12:00.', priority: 'urgent' as const,
+      actionable: true, confidence: 0.95, eventKey: 'pickup', dueAt: unreadable, sources: [messages.at(-1)!.id] }],
+  }) });
+  service.ingest([fixture('pickup')]);
+  // It must not throw out of the transaction and abandon the whole group's chunk.
+  await service.analyzePending(now);
+  assert.equal(store.stats().pendingDelivery, 2, 'an unreadable deadline is not evidence the notice has passed');
+  assert.equal(store.stats().pendingAnalysis, 0, 'and the group was analysed rather than aborted');
+  store.close();
+});
