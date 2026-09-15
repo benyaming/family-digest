@@ -1,0 +1,36 @@
+{
+  "name": "family-brief",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A private WhatsApp inbox assistant for busy parents",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --import tsx src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node --env-file-if-exists=.env dist/main.js",
+    "test": "node --import tsx --test test/*.test.ts",
+    "check": "tsc --noEmit && npm test",
+    "cli": "node --env-file-if-exists=.env --import tsx src/cli.ts",
+    "mcp": "node --env-file-if-exists=.env --import tsx src/mcp.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "cron-parser": "5.10.0",
+    "fastify": "^5.6.0",
+    "luxon": "^3.7.2",
+    "pino": "^9.14.0",
+    "qrcode": "^1.5.4",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/luxon": "^3.7.5",
+    "@types/node": "^22.19.0",
+    "@types/qrcode": "^1.5.6",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

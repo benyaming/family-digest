@@ -1,0 +1,25 @@
+services:
+  family-brief:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      CONFIG_PATH: /app/config.json
+      DATA_DIR: /app/data
+      API_BASE_URL: http://127.0.0.1:8080
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - family-data:/app/data
+      - ./config.json:/app/config.json:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 30s
+volumes:
+  family-data:

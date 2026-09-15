@@ -1,0 +1,13 @@
+node_modules/
+dist/
+data/
+.env
+config.json
+*.db*
+*.sqlite*
+*.log
+.DS_Store
+coverage/
+
+# revmux review archive: local, grows ~0.5MB per round
+.revmux/
