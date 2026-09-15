@@ -60,13 +60,13 @@ Two honest limits. Baileys still performs the protocol-level acknowledgements an
 
 ## Deploying to a server
 
-The image is public and carries nothing private: no `.env`, no `config.json`, no database. Everything secret stays in your environment file and the data volume on the host.
+The image carries nothing private: no `.env`, no `config.json`, no database. GHCR publishes it private by default, so either make the package public once in the repository's settings or `docker login ghcr.io` on the server before pulling. Everything secret stays in your environment file and the data volume on the host.
 
 ```sh
 # on the VPS
 mkdir family-brief && cd family-brief
-curl -O https://raw.githubusercontent.com/OWNER/family-brief/main/compose.prod.yaml
-curl -o .env https://raw.githubusercontent.com/OWNER/family-brief/main/.env.example
+curl -O https://raw.githubusercontent.com/benyaming/family-digest/main/compose.prod.yaml
+curl -o .env https://raw.githubusercontent.com/benyaming/family-digest/main/.env.example
 # fill in API_TOKEN, LLM_*, TELEGRAM_* — then:
 docker compose -f compose.prod.yaml up -d
 ```
@@ -176,7 +176,7 @@ Your direct chat needs no extra configuration: a private chat's ID is your own u
 
 Typing still works for everything — `/kids`, `/watch 2 Даниэль`, `/note 2 текст` — and any plain sentence is treated as a question. The buttons exist so you never need to know that.
 
-Selected groups live in the database, so `config.json` is only a seed plus optional per-group detail. Adding `context` there for a group ID measurably improves digests, and it survives re-selecting the group from chat. Children are not seeded from the file: they are assigned in the chat, and removing a child empties the assignment — a file that put it back would resurrect a child you deleted. No message history is stored for groups you have not selected. This example uses invented names and a placeholder group ID:
+Selected groups live in the database, so `config.json` is only a seed plus optional per-group detail. Adding `context` there for a group ID measurably improves digests, and it survives re-selecting the group from chat. `children` in the file seeds the first run, before anything has been selected from the chat. Once a group is managed from Telegram the stored selection governs it, and the file no longer supplies children — otherwise removing a child would be undone by the file on the next read. No message history is stored for groups you have not selected. This example uses invented names and a placeholder group ID:
 
 ```json
 {
@@ -221,7 +221,7 @@ The session persists through restarts. New selected-group messages will be retai
 /status
 ```
 
-The bot also accepts ordinary Russian questions. Commands stay short and Latin; responses are Russian. `/remember key = value` saves a fact or confirms a suggested fact under its exact key. `/forget key` removes it. Editable family profiles and group assignments live in `config.json`.
+The bot also accepts ordinary Russian questions. Commands stay short and Latin; responses are Russian. `/remember key = value` saves a fact or confirms a suggested fact under its exact key. `/forget key` removes it. Children and group assignments are edited from the chat and stored in the database; `config.json` only seeds the first run and supplies optional per-group context.
 
 ## Historical imports
 
@@ -308,7 +308,7 @@ The implementation uses the [Baileys session and socket APIs](https://baileys.wi
 
 - **One running replica per volume.** The scheduler and Telegram poller are designed for one process. SQLite holds history, full-text search, facts, discussion snapshots, auth credentials/keys, scheduling boundaries, update offsets, and a durable delivery queue.
 - **Retries.** Model failures leave live messages pending. Failed digests retain their original start boundary and retry in five minutes; a missed schedule produces one catch-up digest on return. Telegram delivery retries independently for each recipient, respects `retry_after`, and preserves failed multipart ordering. An ambiguous network failure after Telegram accepted a message can still produce a duplicate: delivery is at least once, not exactly once.
-- **Deduplication.** Ingestion is idempotent by group/message ID. Alerts use model event identity/date plus normalized source text and title. Semantically similar forwards can still escape deduplication; tune the alert rules against real chats.
+- **Deduplication.** Ingestion is idempotent by group/message ID. A unit of analysis publishes one decision, identified by the group and the exact message revisions it read — never by model wording, which differs between fragments and between attempts. Within a decision, findings sharing an event key are merged, so one action reported five times by five fragments is one alert and two genuinely different actions both survive. Across decisions a repeat check compares the group, the revisions of the cited messages, the title and the normalized source text: the same notice forwarded by another parent is suppressed, while the same words arriving as a later revision — a closure reinstated — are not. Semantically similar rewordings can still escape it; tune the alert rules against real chats.
 - **Storage.** `retentionDays: 0` keeps history indefinitely. A positive value prunes older source messages, snapshots, sent deliveries, old alerts, and unconfirmed facts. Confirmed facts and unsent deliveries remain. Existing Telegram messages and your backups are not affected. Database pages and backups are not securely erased by retention cleanup.
 - **Backup.** Stop the service before copying the volume so SQLite and its WAL are consistent. Keep the whole volume, which also contains the linked-device session. For example:
 

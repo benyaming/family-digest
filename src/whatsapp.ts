@@ -278,16 +278,20 @@ export class WhatsApp {
   // Fired on a followed group's first live message, because paging backwards needs a message
   // to page from. Runs detached: the reply the reader is waiting for must not wait for this.
   private backfill(chatId: string, key: WAMessageKey, timestamp: number) {
-    const pending = new Set(this.service.store.get<string[]>('wa:backfill', []));
-    if (!pending.has(chatId) || this.backfilling.has(chatId)) return;
+    if (!new Set(this.service.store.get<string[]>('wa:backfill', [])).has(chatId) || this.backfilling.has(chatId)) return;
     this.backfilling.add(chatId);
     void (async () => {
       try {
-        await this.socket?.fetchMessageHistory(100, key, timestamp);
-        // Only now is the intent spent. Clearing it first meant one failed request — a
-        // reconnect mid-flight, say — silently cost the group its history for good.
-        pending.delete(chatId);
-        this.service.store.set('wa:backfill', [...pending]);
+        // Not optional: without a socket there is no request, and letting `await undefined`
+        // resolve would spend the queue entry as though the history had been asked for.
+        const socket = this.socket;
+        if (!socket?.ws?.isOpen) throw new Error('WhatsApp is not connected');
+        await socket.fetchMessageHistory(100, key, timestamp);
+        // Only now is the intent spent, and read fresh: a group followed while this request
+        // was in flight has been queued since, and writing back a snapshot would drop it.
+        const queued = new Set(this.service.store.get<string[]>('wa:backfill', []));
+        queued.delete(chatId);
+        this.service.store.set('wa:backfill', [...queued]);
       } catch { /* history is a bonus: the group still works going forward without it */ }
       finally { this.backfilling.delete(chatId); }
     })();
@@ -323,18 +327,25 @@ export class WhatsApp {
       getMessage: async () => undefined,
     }));
     this.socket = socket;
-    socket.ev.on('creds.update', auth.saveCreds);
-    socket.ev.on('messages.upsert', ({ messages, type }) => this.receive(messages, type !== 'notify'));
-    socket.ev.on('messaging-history.set', ({ messages, chats }) => { this.noteChats(chats || []); this.receive(messages, true); });
-    socket.ev.on('chats.upsert', chats => this.noteChats(chats || []));
-    socket.ev.on('chats.update', chats => this.noteChats(chats as { id?: string | null; archived?: boolean | null; conversationTimestamp?: unknown }[]));
-    socket.ev.on('messages.update', updates => {
+    // A socket that has been replaced or stopped keeps emitting. Only acting while it is
+    // still ours is what stops an old session writing its credentials over the new one's or
+    // ingesting into a database that has moved on.
+    const live = <T extends unknown[]>(handler: (...args: T) => void) => (...args: T) => {
+      if (this.stopping || socket !== this.socket) return;
+      handler(...args);
+    };
+    socket.ev.on('creds.update', live(auth.saveCreds));
+    socket.ev.on('messages.upsert', live(({ messages, type }) => this.receive(messages, type !== 'notify')));
+    socket.ev.on('messaging-history.set', live(({ messages, chats }) => { this.noteChats(chats || []); this.receive(messages, true); }));
+    socket.ev.on('chats.upsert', live(chats => this.noteChats(chats || [])));
+    socket.ev.on('chats.update', live(chats => this.noteChats(chats as { id?: string | null; archived?: boolean | null; conversationTimestamp?: unknown }[])));
+    socket.ev.on('messages.update', live(updates => {
       for (const { key, update } of updates) {
         if (!key.remoteJid || !key.id) continue;
         if (update.message === null) this.edit(key.remoteJid, key.id, '[Сообщение удалено]', true);
         else if (update.message) { const m = extractText(update.message); if (m) this.edit(key.remoteJid, key.id, m.text); }
       }
-    });
+    }));
     socket.ev.on('connection.update', update => {
       if (this.stopping || socket !== this.socket) return;
       if (update.qr) { this.qr = { value: update.qr, at: Date.now() }; this.status('scan_qr'); }

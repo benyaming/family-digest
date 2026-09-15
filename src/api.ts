@@ -4,6 +4,7 @@ import { z } from 'zod';
 import type { FamilyService } from './service.js';
 import type { WhatsApp } from './whatsapp.js';
 import { durationHours } from './telegram.js';
+import { ReplyError } from './types.js';
 
 export const incomingSchema = z.object({
   chatId: z.string().min(1).max(200), externalId: z.string().min(1).max(250), sender: z.string().min(1).max(250),
@@ -20,6 +21,9 @@ export function buildApi(service: FamilyService, token: string, whatsapp?: Whats
   });
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof z.ZodError) return reply.code(400).send({ error: 'Invalid request', fields: error.issues.map(i => ({ path: i.path, message: i.message })) });
+    // Raised deliberately for the caller — an impossible period, an unknown group. Its text
+    // is safe to return, and a 503 would make a typo indistinguishable from an outage.
+    if (error instanceof ReplyError) return reply.code(400).send({ error: (error as ReplyError).message });
     const status = (error as { statusCode?: number }).statusCode;
     if (status && status < 500) return reply.code(status).send({ error: 'Invalid request' });
     // Provider errors can embed private prompts or credentials; never echo them.

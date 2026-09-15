@@ -2,7 +2,7 @@
 # Everything private lives in .env and the named volume, never in the image.
 services:
   family-brief:
-    image: ${FAMILY_BRIEF_IMAGE:-ghcr.io/OWNER/family-brief:latest}
+    image: ${FAMILY_BRIEF_IMAGE:-ghcr.io/benyaming/family-digest:latest}
     init: true
     restart: unless-stopped
     env_file: .env

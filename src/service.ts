@@ -235,10 +235,15 @@ export class FamilyService {
               // reinstated, say — carry a different revision and are never vetoed by the
               // older one. That distinction is the whole point: a repeat is an annoyance,
               // a silenced reinstatement is a child sent to a school that is shut.
-              const revisionTag = Math.max(...unit.map(m => m.revision));
               const published: { finding: Finding; sources: Message[]; fingerprint: string }[] = [];
               for (const entry of accepted) {
-                const fingerprint = hash(`${group.id}:${revisionTag}:${entry.finding.title.trim().toLocaleLowerCase()}:${entry.sources.map(m => m.text.trim().replace(/\s+/g, ' ')).sort().join('\n')}`);
+                // Scoped by the revisions of the messages this finding actually cites, not by
+                // the unit's highest: an unrelated message being edited must not make a repeat
+                // look new, and editing the cited one must not let a repeat look old. Message
+                // ids stay out, or a forward — a different id carrying the same words — would
+                // never match the notice it copies.
+                const revisions = entry.sources.map(m => m.revision).sort((a, b) => a - b).join(',');
+                const fingerprint = hash(`${group.id}:${revisions}:${entry.finding.title.trim().toLocaleLowerCase()}:${entry.sources.map(m => m.text.trim().replace(/\s+/g, ' ')).sort().join('\n')}`);
                 const repeat = this.store.db.prepare('SELECT id FROM alerts WHERE fingerprint=? AND created_at>?')
                   .get(fingerprint, now - 2 * 86400000);
                 if (!repeat) published.push({ ...entry, fingerprint });

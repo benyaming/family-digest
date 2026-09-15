@@ -298,6 +298,11 @@ export class Telegram {
     // Clearing a Telegram chat deletes it only on the reader's side, so the bot can still
     // edit a message nobody can see. An explicit request always gets a visible new message,
     // and the previous menu is left alone: it is still a real answer to what was asked then.
+    if (fresh) {
+      // Asking for a menu abandons any prompt that was waiting, so the next ordinary
+      // message is a question again rather than an answer to something already left behind.
+      this.service.store.set(`pending:${chatId}`, null);
+    }
     if (fresh && live) {
       this.service.store.set(`menu:${chatId}`, null);
     } else if (live) {
