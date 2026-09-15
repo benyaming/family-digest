@@ -146,7 +146,12 @@ export class FamilyService {
       for (const group of this.groups) {
         try {
           const messages = pending.filter(m => m.chat_id === group.id && !stale.includes(m));
-          for (const chunk of chunkMessages(messages, this.config.chunkCharacters)) {
+          const chunks = chunkMessages(messages, this.config.chunkCharacters);
+          // chunkMessages splits a long message into parts that keep its id, so one message can
+          // span several chunks. It is only settled once its last part has been through.
+          const lastChunkOf = new Map<string, number>();
+          chunks.forEach((part, index) => part.forEach(m => lastChunkOf.set(m.id, index)));
+          for (const [index, chunk] of chunks.entries()) {
             // Include a small recent conversation window so replies/corrections have context.
             const start = Math.min(...chunk.map(m => m.timestamp));
             const earlier = this.store.db.prepare('SELECT * FROM messages WHERE chat_id=? AND timestamp>=? AND timestamp<? ORDER BY timestamp DESC,id DESC LIMIT 15')
@@ -193,8 +198,8 @@ export class FamilyService {
                 for (const recipient of this.recipients) this.store.enqueue(`alert:${id}`, recipient, text, false, finding.priority === 'urgent', now);
               }
               // Decided now, whether or not anything was raised: a second pass over the same
-              // messages must not raise them again.
-              if (group.alerts) this.store.markAlerted(chunk.map(m => m.id));
+              // messages must not raise them again — but only for messages this chunk finishes.
+              if (group.alerts) this.store.markAlerted(chunk.filter(m => lastChunkOf.get(m.id) === index).map(m => m.id));
             });
           }
           // A message may span chunks. A later failure must leave the whole group retryable.

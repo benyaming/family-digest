@@ -418,3 +418,40 @@ test('a retried group does not alert twice, even when the model rewords the find
     'the retry re-analysed the same messages and must not alert on them again');
   store.close();
 });
+test('an edited message can be alerted on again, and a deleted one cannot', async () => {
+  const { service, store } = setup();
+  service.ingest([fixture('notice')]);
+  await service.analyzePending(now);
+  assert.equal(store.stats().pendingDelivery, 2, 'the original alerted');
+  const row = () => store.db.prepare('SELECT analyzed, alerted FROM messages WHERE external_id=?').get('notice') as any;
+  assert.deepEqual([row().analyzed, row().alerted], [1, 1]);
+
+  // A teacher corrects the amount. Being re-read is useless if it can never be raised again.
+  store.db.prepare('UPDATE messages SET text=?,analyzed=?,alerted=? WHERE external_id=?')
+    .run('מחר טיול, להביא 100 ש"ח', 0, 0, 'notice');
+  await service.analyzePending(now);
+  assert.equal(store.stats().pendingDelivery, 4, 'the correction reaches both parents');
+
+  // A deletion is settled: re-opened for analysis, never alerted on.
+  store.db.prepare('UPDATE messages SET text=?,analyzed=?,alerted=? WHERE external_id=?')
+    .run('[Сообщение удалено]', 1, 1, 'notice');
+  await service.analyzePending(now);
+  assert.equal(store.stats().pendingDelivery, 4, 'a deletion raises nothing');
+  store.close();
+});
+test('a message long enough to span chunks is not silenced after its first part', async () => {
+  const seen: string[][] = [];
+  const { service, store } = setup({ analyze: async messages => {
+    seen.push(messages.map(m => m.id));
+    return { overview: '', memories: [], findings: [] };
+  } }, { chunkCharacters: 4000 });
+  // One message, split into parts that keep its id and land in separate chunks.
+  service.ingest([fixture('long', { text: 'א'.repeat(15000) })]);
+  await service.analyzePending(now);
+  assert.ok(seen.length > 1, 'the message really did span chunks');
+  const settled = store.db.prepare('SELECT alerted FROM messages WHERE external_id=?').get('long') as any;
+  assert.equal(settled.alerted, 1, 'and is settled once, after its last part');
+  // Every part was still offered to the model rather than being excluded partway through.
+  assert.equal(seen.filter(ids => ids.includes(seen[0]![0]!)).length, seen.length);
+  store.close();
+});
