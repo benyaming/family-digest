@@ -1,6 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import QRCode from 'qrcode';
 import { Menu, escapeHtml, type Pending } from './menu.js';
+import { ReplyError } from './types.js';
 import type { Env } from './config.js';
 import { FamilyService, isQuiet } from './service.js';
 
@@ -14,9 +15,9 @@ export class TelegramError extends Error {
 }
 export function durationHours(value = '24h') {
   const match = /^(\d+)(h|d)$/i.exec(value);
-  if (!match) throw new Error('Период: 24h, 48h или 7d (до 30 дней).');
+  if (!match) throw new ReplyError('Период: 24h, 48h или 7d (до 30 дней).');
   const hours = Number(match[1]) * (match[2]!.toLowerCase() === 'd' ? 24 : 1);
-  if (hours < 1 || hours > 720) throw new Error('Период должен быть от 1 часа до 30 дней.');
+  if (hours < 1 || hours > 720) throw new ReplyError('Период должен быть от 1 часа до 30 дней.');
   return hours;
 }
 export interface WhatsAppControl {
@@ -383,7 +384,9 @@ export class Telegram {
       catch (e) {
         // A command that rejected the reader's own input explains why; only an unexpected
         // failure gets the generic text, which would otherwise bury "период: 24h, 48h или 7d".
-        const explained = e instanceof Error && !(e instanceof TelegramError) && e.message.length <= 200 ? e.message : '';
+        // Only text written for the reader. Anything else — a model provider's failure above
+        // all — can carry prompt content or credentials and must never be echoed into a chat.
+        const explained = e instanceof ReplyError ? e.message : '';
         reply = explained || 'Не удалось выполнить запрос. Проверьте /status и настройки модели, затем повторите запрос. Для большой сводки попробуйте более короткий период.';
       }
       finally { stop(); }

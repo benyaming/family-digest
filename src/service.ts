@@ -1,6 +1,6 @@
 import { hash, Store } from './db.js';
 import type { Config, Group } from './config.js';
-import type { Analysis, IncomingMessage, Message, Model } from './types.js';
+import { ReplyError, type Analysis, type IncomingMessage, type Message, type Model } from './types.js';
 
 export function chunkMessages(messages: Message[], max: number): Message[][] {
   const chunks: Message[][] = [];
@@ -84,7 +84,7 @@ export class FamilyService {
   selectGroups(filter?: string) {
     if (!filter) return this.groups;
     const matches = this.groups.filter(g => g.id === filter || g.name.toLocaleLowerCase().includes(filter.toLocaleLowerCase()));
-    if (!matches.length) throw new Error('Группа не найдена. Используйте /chats.');
+    if (!matches.length) throw new ReplyError('Группа не найдена. Используйте /chats.');
     return matches;
   }
   formatSource(message: Message) {
@@ -105,10 +105,10 @@ export class FamilyService {
     try { return await run; } finally { this.summaries.delete(key); }
   }
   private async buildSummary(from: number, to: number, filter?: string) {
-    if (!Number.isFinite(from) || !Number.isFinite(to) || from >= to) throw new Error('Некорректный период.');
+    if (!Number.isFinite(from) || !Number.isFinite(to) || from >= to) throw new ReplyError('Некорректный период.');
     const groups = this.selectGroups(filter);
     const messages = this.store.messages(from, to, groups.map(g => g.id), this.config.maxSummaryMessages + 1);
-    if (messages.length > this.config.maxSummaryMessages) throw new Error('Слишком много сообщений. Выберите более короткий период.');
+    if (messages.length > this.config.maxSummaryMessages) throw new ReplyError('Слишком много сообщений. Выберите более короткий период.');
     const date = (ts: number) => new Intl.DateTimeFormat('ru-RU', { timeZone: this.config.timezone, dateStyle: 'short', timeStyle: 'short' }).format(ts);
     const parts = [`Семейная сводка · ${date(from)} — ${date(to)}\nСообщений: ${messages.length}`];
     for (const group of groups) {

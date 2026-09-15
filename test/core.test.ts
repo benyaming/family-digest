@@ -7,7 +7,7 @@ import { Store } from '../src/db.js';
 import { chunkMessages, isQuiet } from '../src/service.js';
 import { parseExport } from '../src/import.js';
 import { loadConfig } from '../src/config.js';
-import { extractText, sqliteAuth, readOnlySocket, WhatsAppWriteBlocked } from '../src/whatsapp.js';
+import { extractText, sqliteAuth, readOnlySocket, WhatsAppWriteBlocked, WhatsApp } from '../src/whatsapp.js';
 import { setup, fixture, now, group, analysis } from './helpers.js';
 
 test('only selected groups are stored; retries are idempotent and imports never become live', () => {
@@ -301,5 +301,20 @@ test('a correction to an event still alerts after the original notice was sent',
   service.ingest([fixture('repeat', { text: notices[0]!.text, timestamp: now - 20000 })]);
   await service.analyzePending(now);
   assert.equal(store.stats().pendingDelivery, 4, 'an identical repeat is still deduplicated');
+  store.close();
+});
+test('closing a WhatsApp session disowns it, so it cannot reconnect into the next link', () => {
+  const { service, store } = setup();
+  const whatsapp = new WhatsApp(service);
+  let ended = 0;
+  const socket: any = { ws: { isOpen: true }, end: () => { ended++; } };
+  (whatsapp as any).socket = socket;
+  (whatsapp as any).timer = setTimeout(() => { throw new Error('a reconnect survived stop()'); }, 50);
+  whatsapp.stop();
+  // Disowned before closing: end() waits on the peer with no bound this code can impose, and
+  // every handler is guarded by `socket !== this.socket`, which only holds once it is not ours.
+  assert.equal((whatsapp as any).socket, undefined, 'the old socket is no longer ours');
+  assert.equal(ended, 1, 'and it was still asked to close');
+  assert.equal((whatsapp as any).qr, undefined);
   store.close();
 });

@@ -1,5 +1,8 @@
 import { z } from 'zod';
 
+/** An error whose message was written for the reader: it is safe, and useful, to show. */
+export class ReplyError extends Error {}
+
 export interface Message {
   id: string; chat_id: string; external_id: string; sender: string;
   timestamp: number; text: string; kind: string; historical: number; analyzed: number;

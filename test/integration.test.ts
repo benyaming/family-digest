@@ -1045,3 +1045,33 @@ test('sending is paced across separate delivery calls, not just within one', asy
   assert.ok(at[1]! - at[0]! >= 1000, `expected pacing between calls, got ${at[1]! - at[0]!}ms`);
   store.close();
 });
+test('a reader sees why their own input was rejected, and never a provider failure', async () => {
+  const sent: string[] = [];
+  const request = (async (_url: unknown, init: RequestInit) => {
+    sent.push(JSON.parse(String(init.body)).text);
+    return Response.json({ ok: true, result: { message_id: sent.length } });
+  }) as unknown as typeof fetch;
+  // A provider error carrying a prompt and a credential, which must never reach a chat.
+  const leak = 'OpenAI 401: invalid api key sk-secret-abc123 for prompt "Даниэль, класс ב2"';
+  const { service, store } = setup({ answer: async () => { throw new Error(leak); } });
+  const bot = new Telegram(service, telegramEnv, request, fakeWhatsApp().control);
+  const dm = { id: 11, type: 'private' };
+  let update = 0;
+
+  await bot.handle({ update_id: ++update, message: { message_id: 1, chat: dm, from: { id: 11 }, text: '/summary 99d' } });
+  await bot.deliver();
+  assert.match(sent.at(-1)!, /Период должен быть от 1 часа до 30 дней/, 'their own mistake is explained');
+
+  await bot.handle({ update_id: ++update, message: { message_id: 2, chat: dm, from: { id: 11 }, text: '/summary banana' } });
+  await bot.deliver();
+  assert.match(sent.at(-1)!, /24h, 48h или 7d/);
+
+  await bot.handle({ update_id: ++update, message: { message_id: 3, chat: dm, from: { id: 11 }, text: 'Когда экскурсия?' } });
+  await bot.deliver();
+  const reply = sent.at(-1)!;
+  assert.doesNotMatch(reply, /sk-secret-abc123/, 'a credential must never be echoed');
+  assert.doesNotMatch(reply, /OpenAI 401/);
+  assert.doesNotMatch(reply, /Даниэль/, 'nor prompt content');
+  assert.match(reply, /Не удалось выполнить запрос/, 'an infrastructure failure gets the generic text');
+  store.close();
+});

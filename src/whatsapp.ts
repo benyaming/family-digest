@@ -213,9 +213,6 @@ export class WhatsApp {
     this.service.store.set('wa:chatmeta', {});
     this.service.store.set('wa:chatsSynced', false);
     this.status('disabled');
-    // Let the socket finish closing before anything is allowed to open a new one, or a
-    // reconnect scheduled by the old session races the next link.
-    await new Promise(resolve => setTimeout(resolve, 250));
     this.stopping = false;
   }
   groups() { return this.service.store.get<{ id: string; name: string }[]>('wa:groups', []); }
@@ -243,7 +240,18 @@ export class WhatsApp {
     }
     if (changed) this.service.store.set('wa:chatmeta', meta);
   }
-  stop() { this.stopping = true; clearTimeout(this.timer); this.socket?.end(undefined); this.qr = undefined; }
+  stop() {
+    this.stopping = true;
+    clearTimeout(this.timer);
+    const socket = this.socket;
+    // Disown it before closing. end() waits on the peer — up to the ws library's 30s backstop —
+    // and emits its close afterwards, so no sleep can bound it. Every handler is guarded by
+    // `socket !== this.socket`, which only fires once the old socket is no longer ours: that is
+    // what stops a closing session from scheduling a reconnect into the next link.
+    this.socket = undefined;
+    this.qr = undefined;
+    socket?.end(undefined);
+  }
   private status(status: string) { this.service.store.set('wa:status', status); }
   private receive(messages: WAMessage[], historical: boolean) {
     for (const message of messages) {
