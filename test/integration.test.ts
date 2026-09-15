@@ -299,7 +299,7 @@ test('an outbox created before the photo column still opens and delivers', () =>
     store.close();
     store = new Store(path);
     assert.equal(store.stats().pendingDelivery, 1);
-    assert.equal(Number((store.db.prepare('PRAGMA user_version').get() as any).user_version), 4);
+    assert.equal(Number((store.db.prepare('PRAGMA user_version').get() as any).user_version), 5);
     store.enqueuePhoto('qr', '111', Buffer.from('png').toString('base64'), 'подпись');
     store.enqueueMenu('menu', '111', 'меню', { inline_keyboard: [] }, Date.now(), 'HTML');
     store.enqueue('code', '111', '<code>ABCD</code>', false, true, Date.now(), 'HTML');

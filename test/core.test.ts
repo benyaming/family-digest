@@ -390,3 +390,31 @@ test('a deadline the schema accepts but no clock can read suppresses nothing and
   assert.equal(store.stats().pendingAnalysis, 0, 'and the group was analysed rather than aborted');
   store.close();
 });
+test('a retried group does not alert twice, even when the model rewords the finding', async () => {
+  let call = 0;
+  const { service, store } = setup({ analyze: async messages => {
+    call++;
+    // The group splits into several chunks. The first is analysed and its alerts commit; a
+    // later one fails, which by design leaves the whole group retryable — so the first chunk
+    // is analysed again, and the model does not word it the same way twice.
+    if (call % 2 === 0) throw new Error('offline');
+    const fresh = messages.at(-1)!;
+    return { overview: '', memories: [], findings: [{
+      title: call === 1 ? 'Экскурсия завтра' : 'Завтра экскурсия для класса',
+      detail: call === 1 ? 'Взять воду.' : 'Нужно взять воду и головной убор.',
+      priority: 'important' as const, actionable: true, confidence: 0.95,
+      eventKey: call === 1 ? 'trip-2026-09-08' : 'class-trip', dueAt: null, sources: [fresh.id],
+    }] };
+  } }, { chunkCharacters: 4000 });
+
+  service.ingest(Array.from({ length: 40 }, (_, i) => fixture(`m${i}`, { timestamp: now - 60000 + i })));
+  await assert.rejects(service.analyzePending(now), 'a later chunk fails');
+  const afterFirst = store.stats().pendingDelivery;
+  assert.equal(afterFirst, 2, 'the first chunk alerted both parents');
+  assert.equal(store.stats().pendingAnalysis, 40, 'and the group stayed retryable');
+
+  await assert.rejects(service.analyzePending(now));
+  assert.equal(store.stats().pendingDelivery, afterFirst,
+    'the retry re-analysed the same messages and must not alert on them again');
+  store.close();
+});

@@ -153,12 +153,18 @@ export class FamilyService {
               .all(group.id, start - 6 * 3600000, start) as unknown as Message[];
             const boundedEarlier = earlier.filter(m => m.text.length < 2000);
             const analysis = await this.model.analyze([...boundedEarlier, ...chunk], this.context(group, now));
+            // A later chunk failing leaves the whole group retryable, so this chunk can be
+            // analysed again after its alerts were already delivered. Whether a message has
+            // been alerted on is the one part of that decision the model cannot reword, so
+            // it is what the retry is judged against — not the title it happens to emit.
+            const settled = this.store.alerted(chunk.map(m => m.id));
             this.store.transaction(() => {
               this.record(group, analysis, now);
               if (group.alerts) for (const finding of analysis.findings) {
                 if (!this.recipients.length || finding.priority === 'routine' || !finding.actionable || finding.confidence < this.config.alertMinConfidence) continue;
-                const freshSources = chunk.filter(m => finding.sources.includes(m.id));
-                if (!freshSources.length) continue; // Never alert on old context alone.
+                const freshSources = chunk.filter(m => finding.sources.includes(m.id) && !settled.has(m.id));
+                // Never alert on old context alone, nor on messages already alerted on.
+                if (!freshSources.length) continue;
                 // Compared by day, not by instant: a model given a date with no clock time
                 // answers midnight, and every same-day notice would read as already expired.
                 // An unparseable deadline suppresses nothing — the schema's offset pattern
@@ -186,6 +192,9 @@ export class FamilyService {
                 const text = `${finding.priority === 'urgent' ? '🚨 Срочно' : '🔔 Важно'} · ${group.name}\n${finding.title}\n${finding.detail}\n\nИсточник:\n${originals}`;
                 for (const recipient of this.recipients) this.store.enqueue(`alert:${id}`, recipient, text, false, finding.priority === 'urgent', now);
               }
+              // Decided now, whether or not anything was raised: a second pass over the same
+              // messages must not raise them again.
+              if (group.alerts) this.store.markAlerted(chunk.map(m => m.id));
             });
           }
           // A message may span chunks. A later failure must leave the whole group retryable.

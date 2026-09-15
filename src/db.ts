@@ -29,6 +29,7 @@ export class Store {
         id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, external_id TEXT NOT NULL,
         sender TEXT NOT NULL, timestamp INTEGER NOT NULL, text TEXT NOT NULL,
         kind TEXT NOT NULL, historical INTEGER NOT NULL, analyzed INTEGER NOT NULL DEFAULT 0,
+        alerted INTEGER NOT NULL DEFAULT 0,
         UNIQUE(chat_id, external_id)
       );
       CREATE INDEX IF NOT EXISTS messages_time ON messages(timestamp, chat_id);
@@ -53,12 +54,19 @@ export class Store {
       );
     `);
     // Databases created before onboarding moved into Telegram predate the photo column.
-    if (Number((this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version) < 4) {
+    if (Number((this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version) < 5) {
       const columns = this.db.prepare('PRAGMA table_info(outbox)').all() as { name: string }[];
       if (!columns.some(c => c.name === 'photo')) this.db.exec('ALTER TABLE outbox ADD COLUMN photo TEXT');
       if (!columns.some(c => c.name === 'markup')) this.db.exec('ALTER TABLE outbox ADD COLUMN markup TEXT');
       if (!columns.some(c => c.name === 'parse_mode')) this.db.exec('ALTER TABLE outbox ADD COLUMN parse_mode TEXT');
-      this.db.exec('PRAGMA user_version=4');
+      const messageColumns = this.db.prepare('PRAGMA table_info(messages)').all() as { name: string }[];
+      // Messages analysed before this column existed were alerted on under the old rules;
+      // defaulting them to 0 would let a later retry alert on them a second time.
+      if (!messageColumns.some(c => c.name === 'alerted')) {
+        this.db.exec('ALTER TABLE messages ADD COLUMN alerted INTEGER NOT NULL DEFAULT 0');
+        this.db.exec('UPDATE messages SET alerted=1 WHERE analyzed=1');
+      }
+      this.db.exec('PRAGMA user_version=5');
     }
   }
   close() { this.db.close(); }
@@ -95,6 +103,16 @@ export class Store {
         WHERE analyzed=0 AND historical=0 AND chat_id IN (${chats.map(() => '?')})
       ) ORDER BY turn,timestamp,id LIMIT ?`)
       .all(...chats, limit) as unknown as Message[];
+  }
+  /** Records that a message's alerts have been decided, so a retry cannot decide them again. */
+  markAlerted(ids: string[]) {
+    const stmt = this.db.prepare('UPDATE messages SET alerted=1 WHERE id=?');
+    ids.forEach(id => stmt.run(id));
+  }
+  alerted(ids: string[]): Set<string> {
+    if (!ids.length) return new Set();
+    return new Set((this.db.prepare(`SELECT id FROM messages WHERE alerted=1 AND id IN (${ids.map(() => '?')})`)
+      .all(...ids) as { id: string }[]).map(r => r.id));
   }
   markAnalyzed(ids: string[]) {
     const stmt = this.db.prepare('UPDATE messages SET analyzed=1 WHERE id=?');

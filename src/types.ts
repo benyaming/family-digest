@@ -5,7 +5,7 @@ export class ReplyError extends Error {}
 
 export interface Message {
   id: string; chat_id: string; external_id: string; sender: string;
-  timestamp: number; text: string; kind: string; historical: number; analyzed: number;
+  timestamp: number; text: string; kind: string; historical: number; analyzed: number; alerted?: number;
 }
 export interface IncomingMessage {
   chatId: string; externalId: string; sender: string; timestamp: number;
