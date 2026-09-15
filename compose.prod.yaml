@@ -1,0 +1,26 @@
+# Deployment against a published image: no build context, no source, no config file.
+# Everything private lives in .env and the named volume, never in the image.
+services:
+  family-brief:
+    image: ${FAMILY_BRIEF_IMAGE:-ghcr.io/OWNER/family-brief:latest}
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      DATA_DIR: /app/data
+      # CONFIG_PATH is deliberately unset: children and groups are configured from Telegram.
+      API_BASE_URL: http://127.0.0.1:8080
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - family-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 30s
+volumes:
+  family-data:
