@@ -296,8 +296,11 @@ export class WhatsApp {
     if (!this.service.chatIds.includes(chatId)) return;
     // The revision bump is what stops an analysis already running against the old text from
     // completing this row: it claimed a revision that no longer exists. A deletion settles.
-    this.service.store.db.prepare('UPDATE messages SET text=?,analyzed=?,revision=revision+1 WHERE chat_id=? AND external_id=?')
-      .run(text, +deleted, chatId, externalId);
+    // Only an edit that changes the text is a new revision. WhatsApp can redeliver the same
+    // edit, and treating a replay as a revision would reopen completed work and let a
+    // reworded re-analysis alert the family about a message that never changed.
+    this.service.store.db.prepare('UPDATE messages SET text=?,analyzed=?,revision=revision+1 WHERE chat_id=? AND external_id=? AND text<>?')
+      .run(text, +deleted, chatId, externalId, text);
   }
   private connecting = false;
   async connect() {

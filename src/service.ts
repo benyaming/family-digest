@@ -1,6 +1,6 @@
 import { hash, Store } from './db.js';
 import type { Config, Group } from './config.js';
-import { ReplyError, type Analysis, type IncomingMessage, type Message, type Model } from './types.js';
+import { ReplyError, type Analysis, type Finding, type IncomingMessage, type Message, type Model } from './types.js';
 
 /** A unit whose messages changed under it while the model was running. */
 class StaleUnit extends Error {}
@@ -187,6 +187,10 @@ export class FamilyService {
               analyses.push(await this.model.analyze([...context, ...fragment], this.context(group, now)));
             }
             this.store.transaction(() => {
+              // Selection and alert permission are read here, not captured before the model
+              // ran: a group unfollowed or muted while it was running must not be published.
+              const current = this.groups.find(g => g.id === group.id);
+              if (!current) throw new StaleUnit();
               // The work was computed against these exact revisions. If any was edited or
               // completed while the model was running, the whole unit is abandoned and the
               // corrected text is left pending for a fresh analysis.
@@ -195,12 +199,18 @@ export class FamilyService {
                 throw new StaleUnit();
               }
               for (const analysis of analyses) this.record(group, analysis, now);
-              if (!group.alerts) return;
-              const raised = new Set<string>();
+              if (!current.alerts || !this.recipients.length) return;
+
+              // One decision per unit, identified by what it was computed from rather than by
+              // what the model called it: the group and the exact revisions it read. Model
+              // wording varies between fragments and between attempts and cannot be identity.
+              const decision = hash(`${group.id}:${unit.map(m => `${m.id}:${m.revision}`).join(',')}`);
+              const accepted: { finding: Finding; sources: Message[] }[] = [];
+              const merged = new Set<string>();
               for (const analysis of analyses) for (const finding of analysis.findings) {
-                if (!this.recipients.length || finding.priority === 'routine' || !finding.actionable || finding.confidence < this.config.alertMinConfidence) continue;
-                const freshSources = unit.filter(m => finding.sources.includes(m.id));
-                if (!freshSources.length) continue; // Never alert on old context alone.
+                if (finding.priority === 'routine' || !finding.actionable || finding.confidence < this.config.alertMinConfidence) continue;
+                const sources = unit.filter(m => finding.sources.includes(m.id));
+                if (!sources.length) continue; // Never alert on old context alone.
                 // Compared by day, not by instant: a model given a date with no clock time
                 // answers midnight, and every same-day notice would read as already expired.
                 // An unparseable deadline suppresses nothing — the schema's offset pattern
@@ -208,25 +218,44 @@ export class FamilyService {
                 // that the notice has passed.
                 const due = finding.dueAt ? Date.parse(finding.dueAt) : Number.NaN;
                 if (Number.isFinite(due) && this.day(due) < this.day(now)) continue;
-                const eventIdentity = finding.eventKey.trim().toLocaleLowerCase() || finding.sources.slice().sort().join(',');
-                const eventDay = finding.dueAt || new Date(Math.max(...freshSources.map(m => m.timestamp))).toISOString().slice(0, 10);
-                // Scoped to the group: two children can be told the same thing on the same day
-                // in their own groups, and the second parent alert must not be read as a repeat.
-                const fingerprint = hash(`${group.id}:${finding.title.trim().toLocaleLowerCase()}:${freshSources.map(m => m.text.trim().replace(/\s+/g, ' ')).sort().join('\n')}`);
-                const id = hash(`${group.id}:${eventIdentity}:${eventDay}:${fingerprint}`);
-                // Within this decision, the same event raised by two fragments is one alert.
-                if (raised.has(id)) continue;
-                raised.add(id);
-                // Across decisions this stays best effort: it suppresses a notice repeated
-                // verbatim, and deliberately does not veto a correction that reads differently.
-                const duplicate = this.store.db.prepare('SELECT id FROM alerts WHERE id=? OR (fingerprint=? AND created_at>?)')
-                  .get(id, fingerprint, now - 2 * 86400000);
-                if (duplicate) continue;
-                this.store.db.prepare('INSERT INTO alerts VALUES(?,?,?,?)').run(id, now, finding.title, fingerprint);
-                const originals = freshSources.slice(0, 2).map(m => this.formatSource({ ...m, text: m.text.slice(0, 800) + (m.text.length > 800 ? '… (полный текст: /source ' + m.id + ')' : '') })).join('\n\n');
-                const text = `${finding.priority === 'urgent' ? '🚨 Срочно' : '🔔 Важно'} · ${group.name}\n${finding.title}\n${finding.detail}\n\nИсточник:\n${originals}`;
-                for (const recipient of this.recipients) this.store.enqueue(`alert:${id}`, recipient, text, false, finding.priority === 'urgent', now);
+                // Fragments of one long notice often report the same action in different
+                // words. Merging inside this decision keeps that one action; two genuinely
+                // different actions carry different event keys and both survive. This is a
+                // merge within one decision, never a veto on a later one.
+                const action = finding.eventKey.trim().toLocaleLowerCase() || finding.sources.slice().sort().join(',');
+                if (merged.has(action)) continue;
+                merged.add(action);
+                accepted.push({ finding, sources });
               }
+              if (!accepted.length) return;
+
+              // Content suppression, scoped to the revision it came from. The same notice
+              // forwarded by a parent is a different message at the same revision and is
+              // suppressed; the same words arriving as a *later* revision — a closure
+              // reinstated, say — carry a different revision and are never vetoed by the
+              // older one. That distinction is the whole point: a repeat is an annoyance,
+              // a silenced reinstatement is a child sent to a school that is shut.
+              const revisionTag = Math.max(...unit.map(m => m.revision));
+              const published: { finding: Finding; sources: Message[]; fingerprint: string }[] = [];
+              for (const entry of accepted) {
+                const fingerprint = hash(`${group.id}:${revisionTag}:${entry.finding.title.trim().toLocaleLowerCase()}:${entry.sources.map(m => m.text.trim().replace(/\s+/g, ' ')).sort().join('\n')}`);
+                const repeat = this.store.db.prepare('SELECT id FROM alerts WHERE fingerprint=? AND created_at>?')
+                  .get(fingerprint, now - 2 * 86400000);
+                if (!repeat) published.push({ ...entry, fingerprint });
+              }
+              if (!published.length) return;
+              for (const [ordinal, { finding, fingerprint }] of published.entries()) {
+                this.store.db.prepare('INSERT OR IGNORE INTO alerts VALUES(?,?,?,?)')
+                  .run(hash(`${decision}:${ordinal}`), now, finding.title, fingerprint);
+              }
+              const urgent = published.some(a => a.finding.priority === 'urgent');
+              const body = published.map(({ finding }) => `${finding.priority === 'urgent' ? '🚨' : '🔔'} ${finding.title}\n${finding.detail}`).join('\n\n');
+              const cited = [...new Map(published.flatMap(a => a.sources).map(m => [m.id, m])).values()].slice(0, 2);
+              const originals = cited.map(m => this.formatSource({ ...m, text: m.text.slice(0, 800) + (m.text.length > 800 ? '… (полный текст: /source ' + m.id + ')' : '') })).join('\n\n');
+              const text = `${urgent ? '🚨 Срочно' : '🔔 Важно'} · ${current.name}\n${body}\n\nИсточник:\n${originals}`;
+              // Keyed by the decision, so re-running a unit that never committed cannot
+              // deliver the same notice twice.
+              for (const recipient of this.recipients) this.store.enqueue(`alert:${decision}`, recipient, text, false, urgent, now);
             });
           } catch (error) {
             // A unit that lost its race is not a failure worth reporting: its messages are

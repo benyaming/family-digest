@@ -53,30 +53,31 @@ export class Store {
         attempts INTEGER NOT NULL DEFAULT 0, sent_at INTEGER, last_error TEXT, photo TEXT, markup TEXT, parse_mode TEXT
       );
     `);
-    // Databases created before onboarding moved into Telegram predate the photo column.
-    if (Number((this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version) < 6) {
-      const columns = this.db.prepare('PRAGMA table_info(outbox)').all() as { name: string }[];
-      if (!columns.some(c => c.name === 'photo')) this.db.exec('ALTER TABLE outbox ADD COLUMN photo TEXT');
-      if (!columns.some(c => c.name === 'markup')) this.db.exec('ALTER TABLE outbox ADD COLUMN markup TEXT');
-      if (!columns.some(c => c.name === 'parse_mode')) this.db.exec('ALTER TABLE outbox ADD COLUMN parse_mode TEXT');
-      const messageColumns = this.db.prepare('PRAGMA table_info(messages)').all() as { name: string }[];
-      // Messages analysed before this column existed were alerted on under the old rules;
-      // defaulting them to 0 would let a later retry alert on them a second time.
-      if (!messageColumns.some(c => c.name === 'alerted')) {
-        this.db.exec('ALTER TABLE messages ADD COLUMN alerted INTEGER NOT NULL DEFAULT 0');
-        this.db.exec('UPDATE messages SET alerted=1 WHERE analyzed=1');
-      }
-      // An application-owned version of the row, bumped by every effective edit. A result
-      // computed against one revision must not be allowed to complete another, and a text
-      // hash cannot express that: an A → B → A edit would make a stale result look current.
-      if (!messageColumns.some(c => c.name === 'revision')) {
-        this.db.exec('ALTER TABLE messages ADD COLUMN revision INTEGER NOT NULL DEFAULT 1');
-        // A message settled under the old rules but left unanalysed is a long notice that was
-        // partly emitted. The flags cannot say how much, so it is settled rather than replayed:
-        // missing the rest of one old notice beats alerting the family about it twice.
-        this.db.exec('UPDATE messages SET analyzed=1 WHERE alerted=1 AND analyzed=0');
-      }
-      this.db.exec('PRAGMA user_version=6');
+    // One transaction for schema, data and version together. Three autocommitted steps meant
+    // an interruption between them left the columns in place, the data cleanup skipped and the
+    // version advanced — permanently, because the cleanup was gated on the column being absent.
+    const version = Number((this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
+    if (version < 6) {
+      this.transaction(() => {
+        const outboxColumns = this.db.prepare('PRAGMA table_info(outbox)').all() as { name: string }[];
+        if (!outboxColumns.some(c => c.name === 'photo')) this.db.exec('ALTER TABLE outbox ADD COLUMN photo TEXT');
+        if (!outboxColumns.some(c => c.name === 'markup')) this.db.exec('ALTER TABLE outbox ADD COLUMN markup TEXT');
+        if (!outboxColumns.some(c => c.name === 'parse_mode')) this.db.exec('ALTER TABLE outbox ADD COLUMN parse_mode TEXT');
+        const messageColumns = this.db.prepare('PRAGMA table_info(messages)').all() as { name: string }[];
+        if (!messageColumns.some(c => c.name === 'alerted')) this.db.exec('ALTER TABLE messages ADD COLUMN alerted INTEGER NOT NULL DEFAULT 0');
+        // An application-owned version of the row, bumped by every effective edit. A result
+        // computed against one revision must not complete another, and a text hash cannot
+        // express that: an A → B → A edit would make a stale result look current again.
+        if (!messageColumns.some(c => c.name === 'revision')) this.db.exec('ALTER TABLE messages ADD COLUMN revision INTEGER NOT NULL DEFAULT 1');
+        // Pre-cutover pending work is settled wholesale, because the old flags cannot tell
+        // work never started from a long notice that was partly emitted: one whose first
+        // fragment alerted and whose last never ran is left at analyzed=0, alerted=0, exactly
+        // like a message nobody has looked at. Replaying it would alert the family a second
+        // time about something they were already told. At most an unanalysed backlog is lost
+        // once, at the upgrade, and only for a database that predates this version.
+        if (version > 0) this.db.exec('UPDATE messages SET analyzed=1 WHERE analyzed=0');
+        this.db.exec('PRAGMA user_version=6');
+      });
     }
   }
   close() { this.db.close(); }

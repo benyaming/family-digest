@@ -114,7 +114,11 @@ test('two distinct actionable items in one notice are both retained', async () =
     const a = analysis(messages); a.findings.push({ ...a.findings[0]!, title: 'Оплатить автобус', eventKey: 'bus-payment-2026-09-08' }); return a;
   } });
   service.ingest([fixture('live')]); await service.analyzePending(now);
-  assert.equal(store.stats().pendingDelivery, 4); store.close();
+  // One notice, one decision: a message each, carrying both actions rather than two alerts.
+  assert.equal(store.stats().pendingDelivery, 2);
+  const sent = (store.db.prepare('SELECT text FROM outbox').all() as any[]).map(r => r.text).join('\n');
+  assert.match(sent, /Подготовиться к экскурсии/); assert.match(sent, /Оплатить автобус/);
+  store.close();
 });
 test('non-actionable, low-confidence and past-deadline findings cannot trigger alerts', async () => {
   const { service, store } = setup({ analyze: async messages => {
@@ -405,8 +409,8 @@ test('a long notice is one decision: an action in its first part and another in 
   service.ingest([fixture('long', { text: 'א'.repeat(15000) })]);
   await service.analyzePending(now);
   assert.equal(call, 5, 'the message really did need five model calls');
-  // Two findings, both parents: four queued. Neither part silences the other.
-  assert.equal(store.stats().pendingDelivery, 4);
+  // One decision for the whole notice: a message each, carrying both actions.
+  assert.equal(store.stats().pendingDelivery, 2);
   const texts = (store.db.prepare('SELECT text FROM outbox').all() as any[]).map(r => r.text).join('\n');
   assert.match(texts, /Забрать в 12:00/); assert.match(texts, /Оплатить автобус/);
   assert.equal(store.stats().pendingAnalysis, 0, 'and the message is settled once, as a whole');
@@ -474,5 +478,77 @@ test('an already completed message cannot be completed twice', () => {
   store.db.prepare('UPDATE messages SET analyzed=0,revision=revision+1').run();
   assert.equal(store.completeUnit(targets), false, 'and a superseded revision is refused');
   assert.equal(store.completeUnit(store.pending([group]).map(m => ({ id: m.id, revision: m.revision }))), true);
+  store.close();
+});
+test('five fragments reporting one action produce one alert, not five', async () => {
+  let call = 0;
+  const { service, store } = setup({ analyze: async messages => {
+    call++;
+    // The same action, worded differently by every fragment — which is what the model does.
+    return { overview: '', memories: [], findings: [{ title: `Экскурсия, вариант ${call}`,
+      detail: 'Взять воду.', priority: 'important' as const, actionable: true, confidence: 0.95,
+      eventKey: 'class-trip-2026-09-08', dueAt: null, sources: [messages.at(-1)!.id] }] };
+  } }, { chunkCharacters: 4000 });
+  service.ingest([fixture('long', { text: 'א'.repeat(15000) })]);
+  await service.analyzePending(now);
+  assert.equal(call, 5, 'five model calls');
+  assert.equal(store.stats().pendingDelivery, 2, 'one decision, one message each — not five alerts');
+  assert.equal(store.db.prepare('SELECT count(*) n FROM alerts').get()!.n, 1);
+  store.close();
+});
+test('a notice reinstated after being cancelled still reaches both parents', async () => {
+  // school open -> school closed -> school open again, same event, same deadline.
+  const { service, store } = setup({ analyze: async messages => {
+    const m = messages.at(-1)!;
+    return { overview: '', memories: [], findings: [{ title: m.text, detail: m.text,
+      priority: 'urgent' as const, actionable: true, confidence: 0.95,
+      eventKey: 'school-open-2026-09-08', dueAt: null, sources: [m.id] }] };
+  } });
+  service.ingest([fixture('notice', { text: 'מחר יש לימודים' })]);
+  await service.analyzePending(now);
+  assert.equal(store.stats().pendingDelivery, 2, 'the original');
+
+  const edit = (text: string) => store.db.prepare('UPDATE messages SET text=?,analyzed=0,revision=revision+1 WHERE external_id=? AND text<>?').run(text, 'notice', text);
+  edit('מחר אין לימודים');
+  await service.analyzePending(now);
+  assert.equal(store.stats().pendingDelivery, 4, 'the cancellation');
+
+  edit('מחר יש לימודים');
+  await service.analyzePending(now);
+  // The words match revision 1 exactly. Suppressing that would leave the family believing
+  // school is shut when it is open.
+  assert.equal(store.stats().pendingDelivery, 6, 'the reinstatement must not be read as a repeat');
+  store.close();
+});
+test('a group unfollowed or muted while the model is running publishes nothing', async () => {
+  for (const change of ['unfollow', 'mute'] as const) {
+    let release: (() => void) | undefined;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const { service, store } = setup({ analyze: async messages => { await held; return analysis(messages); } });
+    service.ingest([fixture('notice')]);
+    const running = service.analyzePending(now);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    if (change === 'unfollow') service.setGroups([]);
+    else service.setGroups(service.groups.map(g => ({ ...g, alerts: false })));
+    release!();
+    await running;
+    assert.equal(store.stats().pendingDelivery, 0, `${change} during analysis must not alert`);
+    store.close();
+  }
+});
+test('the same edit delivered twice is not a new revision', async () => {
+  const { service, store } = setup();
+  service.ingest([fixture('notice')]);
+  await service.analyzePending(now);
+  assert.equal(store.stats().pendingDelivery, 2);
+  const before = store.db.prepare('SELECT revision, analyzed FROM messages WHERE external_id=?').get('notice') as any;
+
+  // WhatsApp redelivers the same edit. Nothing about the message has changed.
+  store.db.prepare('UPDATE messages SET text=?,analyzed=0,revision=revision+1 WHERE external_id=? AND text<>?')
+    .run(before.text ?? 'מחר טיול, להביא מים וכובע', 'notice', 'מחר טיול, להביא מים וכובע');
+  const after = store.db.prepare('SELECT revision, analyzed FROM messages WHERE external_id=?').get('notice') as any;
+  assert.deepEqual([after.revision, after.analyzed], [before.revision, before.analyzed], 'a replay is not a revision');
+  await service.analyzePending(now);
+  assert.equal(store.stats().pendingDelivery, 2, 'and cannot produce a second alert');
   store.close();
 });
