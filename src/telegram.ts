@@ -8,7 +8,7 @@ import { FamilyService, isQuiet } from './service.js';
 export interface TelegramUpdate {
   update_id: number;
   message?: { message_id?: number; text?: string; from?: { id: number }; chat: { id: number; type?: string } };
-  callback_query?: { id: string; data?: string; from: { id: number }; message?: { message_id: number; chat: { id: number; type?: string } } };
+  callback_query?: { id: string; data?: string; from: { id: number }; message?: { message_id: number; reply_markup?: unknown; chat: { id: number; type?: string } } };
 }
 export class TelegramError extends Error {
   constructor(public code: number, public retryAfter = 0, public description = '') { super(`Telegram HTTP/API error ${code}`); }
@@ -294,7 +294,7 @@ export class Telegram {
   //
   // A route that ends by editing a message cannot use it at all — an edit is not a delivered
   // message and does not clear it. Those wait in the message itself, which the result replaces.
-  private working(chatId: string, editMessage?: number) {
+  private working(chatId: string, edit?: { id: number; markup: unknown }) {
     let done = false;
     let inflight: Promise<void> | undefined;
     // Delivery to this chat is what clears the indicator, and the outbox drains on its own
@@ -303,18 +303,26 @@ export class Telegram {
     // including when what went out belonged to something else. The next request arms its own.
     const sends = this.delivered.get(chatId) ?? 0;
     const show = () => {
-      // A send in progress has not incremented the count yet: it still has pacing and a round
-      // trip in front of it, and an action started now would land behind it and outlive it.
-      if (done || inflight || this.sending.has(chatId) || (this.delivered.get(chatId) ?? 0) !== sends) return;
-      // A waiting screen is an edit of real content and takes the normal budget. A chat action
-      // is cosmetic, takes a short one, and is the only kind delivery has to be ordered behind:
-      // an edit cannot re-arm anything, so holding a reply for one would buy nothing.
-      const call = editMessage
-        ? this.call('editMessageText', { chat_id: chatId, message_id: editMessage, text: Telegram.waiting })
+      if (done || inflight) return;
+      // Both guards below describe what a delivered message does to a chat action, which is
+      // clear it — so renewing one afterwards animates over a message already on screen. An
+      // edit names one message, which a delivery neither clears nor re-arms, and it gets a
+      // single attempt with no refresh behind it. Spending that attempt here would leave the
+      // slowest screens with no cue at all, which is the case this exists for.
+      if (!edit && (this.sending.has(chatId) || (this.delivered.get(chatId) ?? 0) !== sends)) return;
+      // Both are cosmetic and both take the short budget. The result waits behind whichever
+      // is outstanding, and the poll loop behind that is serial, so an unbounded one stops
+      // every chat rather than just this screen.
+      //
+      // The waiting screen carries the keyboard it found. Omitting reply_markup is how an
+      // edit strips one, and the worst a replacement that never lands can then leave behind
+      // is the previous screen under a spinner: stale, but still the menu it was.
+      const call = edit
+        ? this.call('editMessageText', { chat_id: chatId, message_id: edit.id, text: Telegram.waiting, reply_markup: edit.markup }, 2000)
         : this.call('sendChatAction', { chat_id: chatId, action: 'typing' }, 2000);
       // Announcing the work is not the work: a failure here is invisible and stays that way.
       inflight = call.then(() => {}, () => {}).finally(() => { inflight = undefined; });
-      if (!editMessage) this.actions.set(chatId, inflight);
+      if (!edit) this.actions.set(chatId, inflight);
     };
     let refresh: ReturnType<typeof setInterval> | undefined;
     // Most routes answer in well under a second. An indicator armed for those animates for five
@@ -322,7 +330,7 @@ export class Telegram {
     const first = setTimeout(() => {
       show();
       // An edit stays until it is replaced. Only the chat action expires and needs renewing.
-      if (!editMessage) { refresh = setInterval(show, 4000); refresh.unref?.(); }
+      if (!edit) { refresh = setInterval(show, 4000); refresh.unref?.(); }
     }, 700);
     first.unref?.();
     // Scheduling stops before the wait, so nothing new is sent while the caller is waiting to
@@ -380,7 +388,7 @@ export class Telegram {
     const chatId = String(message.chat.id);
     this.service.store.set(`menu:${chatId}`, message.message_id);
     let screen;
-    const stop = this.working(chatId, message.message_id);
+    const stop = this.working(chatId, { id: message.message_id, markup: message.reply_markup });
     try { screen = await this.menu.route(query.data || 'home', chatId); }
     catch { screen = { text: 'Не удалось выполнить действие. Откройте меню заново: /start', markup: { inline_keyboard: [] } }; }
     finally { await stop(); }
@@ -403,11 +411,14 @@ export class Telegram {
       const pending = direct ? store.get<Pending | null>(`pending:${chatId}`, null) : null;
       // A prompt is waiting for this text, so it is an answer rather than a question.
       if (pending && !text.startsWith('/')) {
+        // No cue on this path. It ends by editing the prompt in place, so a chat action would
+        // still be running over the result; and a waiting screen needs the keyboard it stands
+        // in for, which only a callback query carries. A bare one would strip the prompt's
+        // Отмена button and leave nothing behind if the result never landed, which is a worse
+        // answer to a few seconds of silence than the silence is.
         let screen;
-        const stop = this.working(chatId, store.get<number | null>(`menu:${chatId}`, null) ?? undefined);
         try { screen = await this.menu.input(pending, text, chatId); }
         catch { store.set(`pending:${chatId}`, null); screen = this.menu.home(); }
-        finally { await stop(); }
         // The prompt becomes the result in place, so its Отмена button cannot go stale.
         // What the reader typed is theirs and stays where they put it.
         await this.renderMenu(chatId, `reply:${update.update_id}`, screen);
@@ -425,6 +436,11 @@ export class Telegram {
           // Holding the indicator across that kept it refreshing while this menu waited on
           // somebody else's delivery, long after its own answer was on screen.
           try { screen = await this.menu.route(route, chatId); }
+          // Both sibling call sites substitute a screen rather than let this out, and
+          // Menu.groups reaches an unguarded refreshGroups. Escaping here would reach poll()
+          // with the offset still unadvanced, so the same update would be handed back and
+          // throw again, and no chat would be served until WhatsApp recovered on its own.
+          catch { screen = { text: 'Не удалось открыть меню. Попробуйте ещё раз: /start', markup: { inline_keyboard: [] } }; }
           finally { await stopMenu(); }
           await this.renderMenu(chatId, `reply:${update.update_id}`, screen, true);
           store.set('telegram:offset', update.update_id + 1);

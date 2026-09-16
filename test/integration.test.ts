@@ -993,6 +993,55 @@ test('a waiting screen is never paid for by a real message', async () => {
   store.close();
 });
 
+test('a delivery elsewhere does not cost the waiting screen its only attempt', async () => {
+  const t = transport();
+  const slow = held();
+  const { service, store } = setup({}, { family: [{ name: 'Даниэль', context: '' }] });
+  const wa = fakeWhatsApp([{ id: 'a@g.us', name: 'Класс' }]);
+  wa.control.unlink = async () => { await slow.work; };
+  const bot = new Telegram(service, telegramEnv, t.request, wa.control);
+  const keyboard = { inline_keyboard: [[{ text: '❌ Отвязать', callback_data: 'unlink:yes' }]] };
+  const tap = bot.onCallback({ id: 'q1', data: 'unlink:yes', from: { id: 11 }, message: { message_id: 777, reply_markup: keyboard, chat: dm } });
+  // A chat action would rightly stand down after this: the delivery clears it in the client, so
+  // renewing it would animate over a message already on screen. A waiting screen names one
+  // message, which no delivery touches, and it gets a single attempt with no refresh behind it
+  // — standing down here means the slowest screens in the bot show nothing at all.
+  store.enqueue('alert:1', '11', 'Сбор в 8:00', false, true);
+  await bot.deliver();
+  assert.equal(t.count('sendMessage'), 1, 'the unrelated alert went out first');
+  await tick(900);
+  assert.equal(t.count('editMessageText'), 1, 'the waiting screen still takes its turn');
+  slow.release();
+  await tap;
+  store.close();
+});
+
+test('a delivery from elsewhere waits for a chat action already in flight', async () => {
+  const t = transport();
+  // The only thing stopping the outbox timer in main.ts from overtaking an indicator armed by
+  // work it knows nothing about, and the one invariant none of the other tests reach: with the
+  // await in pass() deleted, every one of them still passes.
+  t.hold.add('sendChatAction');
+  const slow = held();
+  const { service, store } = setup({ answer: async () => { await slow.work; return { answer: 'ответ', sources: [] }; } }, { family: [] });
+  const bot = new Telegram(service, telegramEnv, t.request, fakeWhatsApp().control);
+  const handling = bot.handle({ update_id: 1, message: { message_id: 500, chat: dm, from: { id: 11 }, text: 'Когда экскурсия?' } });
+  await tick(900);
+  assert.equal(t.count('sendChatAction'), 1, 'armed, and stuck in flight');
+  // An alert for the same chat, belonging to nothing this reader asked for.
+  store.enqueue('alert:1', '11', 'Сбор в 8:00', false, true);
+  const draining = bot.deliver();
+  const order = await Promise.race([draining.then(() => 'sent'), tick(1200).then(() => 'held')]);
+  assert.equal(order, 'held', 'the alert is ordered behind the action rather than in front of it');
+  assert.equal(t.count('sendMessage'), 0);
+  t.release('sendChatAction');
+  await draining;
+  assert.equal(t.count('sendMessage'), 1, 'and goes out once the action has landed');
+  slow.release();
+  await handling;
+  store.close();
+});
+
 test('a slow button press waits inside the message it is about to replace', async () => {
   const t = transport();
   const slow = held();
@@ -1000,7 +1049,8 @@ test('a slow button press waits inside the message it is about to replace', asyn
   const wa = fakeWhatsApp([{ id: 'a@g.us', name: 'Класс' }]);
   wa.control.unlink = async () => { await slow.work; wa.calls.push('unlink'); };
   const bot = new Telegram(service, telegramEnv, t.request, wa.control);
-  const tap = bot.onCallback({ id: 'q1', data: 'unlink:yes', from: { id: 11 }, message: { message_id: 777, chat: dm } });
+  const keyboard = { inline_keyboard: [[{ text: '❌ Отвязать', callback_data: 'unlink:yes' }]] };
+  const tap = bot.onCallback({ id: 'q1', data: 'unlink:yes', from: { id: 11 }, message: { message_id: 777, reply_markup: keyboard, chat: dm } });
   await tick(900);
   // An edit is not a delivered message, so a chat action here would still be animating after
   // the screen it announced had already arrived. The message being replaced says it instead.
@@ -1008,6 +1058,9 @@ test('a slow button press waits inside the message it is about to replace', asyn
   assert.equal(t.count('editMessageText'), 1);
   assert.equal(t.body('editMessageText').message_id, 777);
   assert.match(t.body('editMessageText').text, /Секунду/);
+  // Omitting reply_markup is how an edit strips a keyboard. Stripping it here would leave a
+  // spinner nobody can tap whenever the result that replaces it never arrives.
+  assert.deepEqual(t.body('editMessageText').reply_markup, keyboard, 'the keyboard survives the wait');
   slow.release();
   await tap;
   assert.equal(t.count('editMessageText'), 2, 'the result replaces the waiting screen in place');
