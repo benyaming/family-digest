@@ -852,38 +852,223 @@ test('opening the chat list fetches the chat snapshot once, without being asked'
   assert.equal(store.get('wa:chatsSynced', false), false, 'a failure does not consume the one attempt');
   store.close();
 });
-test('slow work shows a typing indicator, refreshed until it finishes, then stopped', async () => {
-  const sent: any[] = [];
+// A held response is the only way to see the order of two requests the bot makes at once,
+// which is where the indicator went wrong: it was sent and never waited for.
+const transport = () => {
+  const sent: { method: string; body: any }[] = [];
+  const held = new Map<string, (() => void)[]>();
+  const hold = new Set<string>();
   const request = (async (url: string, init: RequestInit) => {
-    sent.push({ method: String(url).split('/').pop(), body: JSON.parse(String(init.body)) });
+    const method = String(url).split('/').pop()!;
+    sent.push({ method, body: JSON.parse(String(init.body)) });
+    if (hold.has(method)) await new Promise<void>(resolve => held.set(method, [...(held.get(method) ?? []), resolve]));
     return Response.json({ ok: true, result: { message_id: 900 } });
   }) as unknown as typeof fetch;
-  let release: (() => void) | undefined;
-  const slow = new Promise<void>(resolve => { release = resolve; });
-  const { service, store } = setup({ answer: async () => { await slow; return { answer: 'ответ', sources: [] }; } }, { family: [] });
-  const bot = new Telegram(service, telegramEnv, request, fakeWhatsApp().control);
-  const dm = { id: 11, type: 'private' };
-  const actions = () => sent.filter(s => s.method === 'sendChatAction');
+  return { sent, request, hold, count: (m: string) => sent.filter(s => s.method === m).length,
+    body: (m: string, n = 0) => sent.filter(s => s.method === m)[n]!.body,
+    // Releasing stops holding that method too: a test that held one send is rarely asking to
+    // hang on the next one, and a request nothing ever releases just stalls the suite.
+    release: (m: string) => { hold.delete(m); (held.get(m) ?? []).forEach(resolve => resolve()); held.set(m, []); } };
+};
+const tick = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const dm = { id: 11, type: 'private' };
+const held = () => { let release!: () => void; return { work: new Promise<void>(resolve => { release = resolve; }), release: () => release() }; };
 
-  const handling = bot.handle({ update_id: 1, message: { message_id: 500, chat: dm, from: { id: 11 }, text: 'Когда экскурсия?' } });
-  // The indicator appears immediately, before any answer exists.
-  await new Promise(resolve => setTimeout(resolve, 50));
-  assert.equal(actions().length, 1);
-  assert.deepEqual(actions()[0]!.body, { chat_id: '11', action: 'typing' });
-  assert.equal(sent.filter(s => s.method === 'sendMessage').length, 0);
-  // Telegram expires it after about five seconds, so it is refreshed while work continues.
-  await new Promise(resolve => setTimeout(resolve, 4300));
-  assert.ok(actions().length >= 2, 'the indicator is kept alive');
-  release!();
+test('a quick answer never arms the typing indicator, and a slow one arms it late and stops with the work', async () => {
+  const t = transport();
+  const slow = held();
+  const { service, store } = setup({ answer: async () => { await slow.work; return { answer: 'ответ', sources: [] }; } }, { family: [] });
+  const bot = new Telegram(service, telegramEnv, t.request, fakeWhatsApp().control);
+  // /status answers out of the database immediately. An indicator armed for that animates for
+  // five seconds over an answer already on screen, which is most of what a reader ever sees.
+  await bot.handle({ update_id: 1, message: { message_id: 500, chat: dm, from: { id: 11 }, text: '/status' } });
+  assert.equal(t.count('sendChatAction'), 0, 'work that is already done announces nothing');
+  const handling = bot.handle({ update_id: 2, message: { message_id: 501, chat: dm, from: { id: 11 }, text: 'Когда экскурсия?' } });
+  await tick(300);
+  assert.equal(t.count('sendChatAction'), 0, 'the indicator waits to be earned');
+  await tick(600);
+  assert.equal(t.count('sendChatAction'), 1);
+  assert.deepEqual(t.body('sendChatAction'), { chat_id: '11', action: 'typing' });
+  // Telegram expires it after about five seconds, so it is renewed while the work continues.
+  await tick(4200);
+  assert.equal(t.count('sendChatAction'), 2, 'renewed once, and never overlapping itself');
+  slow.release();
   await handling;
-  const afterFinish = actions().length;
+  const armed = t.count('sendChatAction');
   await bot.deliver();
-  await new Promise(resolve => setTimeout(resolve, 4300));
-  // Once the work is done it stops: no indicator outlives the reply.
-  assert.equal(actions().length, afterFinish, 'the indicator stops when the work stops');
-  assert.match(sent.find(s => s.method === 'sendMessage')!.body.text, /ответ/);
+  await tick(4300);
+  assert.equal(t.count('sendChatAction'), armed, 'nothing outlives the reply it announced');
+  assert.match(t.body('sendMessage', 1).text, /ответ/);
   store.close();
 });
+
+test('a reply never overtakes the chat action that announced it', async () => {
+  const t = transport();
+  // Nothing recalls an action already sent. One landing after the reply re-arms the indicator
+  // the reply itself clears, and it then animates for five seconds with nothing behind it.
+  t.hold.add('sendChatAction');
+  const slow = held();
+  const { service, store } = setup({ answer: async () => { await slow.work; return { answer: 'ответ', sources: [] }; } }, { family: [] });
+  const bot = new Telegram(service, telegramEnv, t.request, fakeWhatsApp().control);
+  const handling = bot.handle({ update_id: 1, message: { message_id: 500, chat: dm, from: { id: 11 }, text: 'Когда экскурсия?' } });
+  await tick(900);
+  assert.equal(t.count('sendChatAction'), 1);
+  slow.release();
+  await tick(300);
+  assert.equal(t.count('sendMessage'), 0, 'the answer is held until the action it follows has landed');
+  t.release('sendChatAction');
+  await handling;
+  assert.equal(t.count('sendMessage'), 1);
+  assert.match(t.body('sendMessage').text, /ответ/);
+  store.close();
+});
+
+test('a message delivered while the work runs ends the indicator instead of re-arming it', async () => {
+  const t = transport();
+  const slow = held();
+  const { service, store } = setup({ answer: async () => { await slow.work; return { answer: 'ответ', sources: [] }; } }, { family: [] });
+  const bot = new Telegram(service, telegramEnv, t.request, fakeWhatsApp().control);
+  const handling = bot.handle({ update_id: 1, message: { message_id: 500, chat: dm, from: { id: 11 }, text: 'Когда экскурсия?' } });
+  await tick(900);
+  assert.equal(t.count('sendChatAction'), 1);
+  // The outbox drains on its own timer, knowing nothing about work in progress. Whatever it
+  // sends clears the indicator in the client, so renewing it afterwards animates over a
+  // message the reader can already see — which no later reply is obliged to come and clear.
+  store.enqueue('alert:1', '11', 'Сбор в 8:00', false, true);
+  await bot.deliver();
+  assert.equal(t.count('sendMessage'), 1);
+  await tick(4300);
+  assert.equal(t.count('sendChatAction'), 1, 'delivery ended it; a refresh would have re-armed it');
+  slow.release();
+  await handling;
+  store.close();
+});
+
+test('an indicator cannot start during a send already under way', async () => {
+  const t = transport();
+  // Between deciding to send and the message landing there is pacing and a round trip. An
+  // action started inside that window is not stopped by counting deliveries, because the
+  // delivery it would outlive has not been counted yet.
+  t.hold.add('sendMessage');
+  const slow = held();
+  const { service, store } = setup({ answer: async () => { await slow.work; return { answer: 'ответ', sources: [] }; } }, { family: [] });
+  const bot = new Telegram(service, telegramEnv, t.request, fakeWhatsApp().control);
+  const handling = bot.handle({ update_id: 1, message: { message_id: 500, chat: dm, from: { id: 11 }, text: 'Когда экскурсия?' } });
+  store.enqueue('alert:1', '11', 'Сбор в 8:00', false, true);
+  const draining = bot.deliver();
+  await tick(900);
+  assert.equal(t.count('sendMessage'), 1, 'the send is in flight, not yet acknowledged');
+  assert.equal(t.count('sendChatAction'), 0, 'the grace timer found a send under way and stood down');
+  t.release('sendMessage');
+  await draining;
+  await tick(4300);
+  assert.equal(t.count('sendChatAction'), 0);
+  slow.release();
+  await handling;
+  store.close();
+});
+
+test('a waiting screen is never paid for by a real message', async () => {
+  const t = transport();
+  // The waiting screen is an edit and takes the normal budget. Ordering replies behind it, as
+  // a chat action must be ordered, would let a cosmetic edit hold real content for as long.
+  t.hold.add('editMessageText');
+  const slow = held();
+  const { service, store } = setup({}, { family: [{ name: 'Даниэль', context: '' }] });
+  const wa = fakeWhatsApp([{ id: 'a@g.us', name: 'Класс' }]);
+  wa.control.unlink = async () => { await slow.work; };
+  const bot = new Telegram(service, telegramEnv, t.request, wa.control);
+  const tap = bot.onCallback({ id: 'q1', data: 'unlink:yes', from: { id: 11 }, message: { message_id: 777, chat: dm } });
+  await tick(900);
+  assert.equal(t.count('editMessageText'), 1, 'the waiting screen is in flight and stuck there');
+  store.enqueue('alert:1', '11', 'Сбор в 8:00', false, true);
+  // Raced rather than awaited: ordering the alert behind the waiting screen does not make this
+  // assertion fail, it makes it never return, and a stalled suite says far less than a failure.
+  const drain = await Promise.race([bot.deliver().then(() => 'sent'), tick(1500).then(() => 'held')]);
+  assert.equal(drain, 'sent', 'the alert went out without waiting for a cosmetic edit');
+  assert.equal(t.count('sendMessage'), 1);
+  t.release('editMessageText');
+  slow.release();
+  await tap;
+  store.close();
+});
+
+test('a delivery elsewhere does not cost the waiting screen its only attempt', async () => {
+  const t = transport();
+  const slow = held();
+  const { service, store } = setup({}, { family: [{ name: 'Даниэль', context: '' }] });
+  const wa = fakeWhatsApp([{ id: 'a@g.us', name: 'Класс' }]);
+  wa.control.unlink = async () => { await slow.work; };
+  const bot = new Telegram(service, telegramEnv, t.request, wa.control);
+  const keyboard = { inline_keyboard: [[{ text: '❌ Отвязать', callback_data: 'unlink:yes' }]] };
+  const tap = bot.onCallback({ id: 'q1', data: 'unlink:yes', from: { id: 11 }, message: { message_id: 777, reply_markup: keyboard, chat: dm } });
+  // A chat action would rightly stand down after this: the delivery clears it in the client, so
+  // renewing it would animate over a message already on screen. A waiting screen names one
+  // message, which no delivery touches, and it gets a single attempt with no refresh behind it
+  // — standing down here means the slowest screens in the bot show nothing at all.
+  store.enqueue('alert:1', '11', 'Сбор в 8:00', false, true);
+  await bot.deliver();
+  assert.equal(t.count('sendMessage'), 1, 'the unrelated alert went out first');
+  await tick(900);
+  assert.equal(t.count('editMessageText'), 1, 'the waiting screen still takes its turn');
+  slow.release();
+  await tap;
+  store.close();
+});
+
+test('a delivery from elsewhere waits for a chat action already in flight', async () => {
+  const t = transport();
+  // The only thing stopping the outbox timer in main.ts from overtaking an indicator armed by
+  // work it knows nothing about, and the one invariant none of the other tests reach: with the
+  // await in pass() deleted, every one of them still passes.
+  t.hold.add('sendChatAction');
+  const slow = held();
+  const { service, store } = setup({ answer: async () => { await slow.work; return { answer: 'ответ', sources: [] }; } }, { family: [] });
+  const bot = new Telegram(service, telegramEnv, t.request, fakeWhatsApp().control);
+  const handling = bot.handle({ update_id: 1, message: { message_id: 500, chat: dm, from: { id: 11 }, text: 'Когда экскурсия?' } });
+  await tick(900);
+  assert.equal(t.count('sendChatAction'), 1, 'armed, and stuck in flight');
+  // An alert for the same chat, belonging to nothing this reader asked for.
+  store.enqueue('alert:1', '11', 'Сбор в 8:00', false, true);
+  const draining = bot.deliver();
+  const order = await Promise.race([draining.then(() => 'sent'), tick(1200).then(() => 'held')]);
+  assert.equal(order, 'held', 'the alert is ordered behind the action rather than in front of it');
+  assert.equal(t.count('sendMessage'), 0);
+  t.release('sendChatAction');
+  await draining;
+  assert.equal(t.count('sendMessage'), 1, 'and goes out once the action has landed');
+  slow.release();
+  await handling;
+  store.close();
+});
+
+test('a slow button press waits inside the message it is about to replace', async () => {
+  const t = transport();
+  const slow = held();
+  const { service, store } = setup({}, { family: [{ name: 'Даниэль', context: '' }] });
+  const wa = fakeWhatsApp([{ id: 'a@g.us', name: 'Класс' }]);
+  wa.control.unlink = async () => { await slow.work; wa.calls.push('unlink'); };
+  const bot = new Telegram(service, telegramEnv, t.request, wa.control);
+  const keyboard = { inline_keyboard: [[{ text: '❌ Отвязать', callback_data: 'unlink:yes' }]] };
+  const tap = bot.onCallback({ id: 'q1', data: 'unlink:yes', from: { id: 11 }, message: { message_id: 777, reply_markup: keyboard, chat: dm } });
+  await tick(900);
+  // An edit is not a delivered message, so a chat action here would still be animating after
+  // the screen it announced had already arrived. The message being replaced says it instead.
+  assert.equal(t.count('sendChatAction'), 0);
+  assert.equal(t.count('editMessageText'), 1);
+  assert.equal(t.body('editMessageText').message_id, 777);
+  assert.match(t.body('editMessageText').text, /Секунду/);
+  // Omitting reply_markup is how an edit strips a keyboard. Stripping it here would leave a
+  // spinner nobody can tap whenever the result that replaces it never arrives.
+  assert.deepEqual(t.body('editMessageText').reply_markup, keyboard, 'the keyboard survives the wait');
+  slow.release();
+  await tap;
+  assert.equal(t.count('editMessageText'), 2, 'the result replaces the waiting screen in place');
+  assert.match(t.body('editMessageText', 1).text, /отвязан/);
+  assert.deepEqual(wa.calls, ['unlink']);
+  store.close();
+});
+
 test('unlinking is reachable, confirmed first, and keeps everything except the link', async () => {
   const { service, store } = setup({}, { groups: [], family: [{ name: 'Даниэль', context: '' }] });
   const wa = fakeWhatsApp([{ id: 'a@g.us', name: 'Класс' }]);
